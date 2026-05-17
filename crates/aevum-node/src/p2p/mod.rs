@@ -51,3 +51,5 @@ impl P2pNode {
         P2pHandle { sender: cmd_tx }
     }
 }
+pub mod peer_score;
+pub mod addr_manager;
