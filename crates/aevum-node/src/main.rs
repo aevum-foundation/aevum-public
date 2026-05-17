@@ -14,7 +14,7 @@ use aevum_node::task_pool::TaskPool;
 use aevum_node::p2p::peers::PeersManager;
 use aevum_node::p2p::sync::{AtpMessage, SyncContext, create_status, handle_atp_message};
 use aevum_node::p2p::gossip::GossipManager;
-use aevum_node::p2p::noise::{NoiseCipher, TofuStore};
+use aevum_node::p2p::noise::{AtpCipher, TofuStore};
 use clap::Parser;
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -159,7 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             match aevum_node::p2p::peers::dial_peer(addr, dk.clone(), &dt).await {
                                 Ok((cipher, peer_id, stream)) => {
                                     tracing::info!("✅ CONNECTED to {}", hex::encode(&peer_id));
-                                    run_connection(stream, cipher, peer_id, addr, dp.clone(), dc.clone()).await;
+                                    run_connection(stream, cipher, peer_id, addr, dp.clone(), dc.clone(), false).await;
                                 }
                                 Err(e) => tracing::warn!("Dial failed: {}", e),
                             }
@@ -177,7 +177,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             match aevum_node::p2p::peers::accept_connection(stream, kc, &tc).await {
                                 Ok((cipher, peer_id, remote_addr, stream)) => {
                                     tracing::info!("✅ Accepted from {}", hex::encode(&peer_id));
-                                    run_connection(stream, cipher, peer_id, remote_addr, pc, cc).await;
+                                    run_connection(stream, cipher, peer_id, remote_addr, pc, cc, true).await;
                                 }
                                 Err(e) => tracing::warn!("Accept failed: {}", e),
                             }
@@ -294,62 +294,173 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 // ============================================================
 async fn run_connection(
     stream: TcpStream,
-    cipher: NoiseCipher,
+    cipher: AtpCipher,
     peer_id: [u8; 20],
     addr: SocketAddr,
     peers: Arc<PeersManager>,
     ctx: Arc<SyncContext>,
+    is_server: bool,
 ) {
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
-    let tx_clone = tx.clone();
     peers.register_peer(peer_id, addr, tx);
 
-    let cipher = Arc::new(StdMutex::new(cipher));
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let mut stream = stream;
+    let send_cipher = Arc::new(StdMutex::new(cipher));
+    let recv_secret = send_cipher.lock().unwrap().shared_secret_bytes();
+    let recv_cipher = Arc::new(StdMutex::new(AtpCipher::new(&recv_secret)));
+    if is_server {
+        // СЕРВЕР: читаем → отправляем статус → отправляем блоки
+        let peer_status = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut len_buf = [0u8; 4];
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut len_buf).await?;
+            let len = u32::from_be_bytes(len_buf) as usize;
+                    tracing::info!("[ATP] Client read len: {}", len);
+            if len > 10 * 1024 * 1024 {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "too large"));
+            }
+            let mut encrypted = vec![0u8; len];
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut encrypted).await?;
+            Ok::<Vec<u8>, std::io::Error>(encrypted)
+        }).await;
 
-    let status = create_status(&ctx);
-    if let Ok(data) = bincode::serialize(&status) {
-        let encrypted = cipher.lock().unwrap().encrypt(&data);
-        let len = (encrypted.len() as u32).to_be_bytes();
-        let mut packet = Vec::with_capacity(4 + encrypted.len());
-        packet.extend_from_slice(&len);
-        packet.extend_from_slice(&encrypted);
-        if tokio::io::AsyncWriteExt::write_all(&mut writer, &packet).await.is_ok() {
-            tracing::info!("📤 Status sent to {}", hex::encode(&peer_id));
-        }
-    }
+        let peer_height = match peer_status {
+            Ok(Ok(encrypted)) => {
+                if let Some(plaintext) = recv_cipher.lock().unwrap().decrypt(&encrypted) {
+                    if let Ok(msg) = bincode::deserialize::<AtpMessage>(&plaintext) {
+                        tracing::info!("📊 Peer status received from {}", hex::encode(&peer_id));
+                        if let AtpMessage::Status { height, .. } = &msg { *height } else { 0 }
+                    } else { 0 }
+                } else { 0 }
+            }
+            Ok(Err(e)) => { tracing::warn!("Handshake read error: {}", e); peers.remove_peer(&peer_id); return; }
+            Err(_) => { tracing::warn!("Handshake timeout"); peers.remove_peer(&peer_id); return; }
+        };
 
-    let send_cipher = cipher.clone();
-    let send_handle = tokio::spawn(async move {
-        let mut rx = rx;
-        while let Some(data) = rx.recv().await {
+        let my_status = create_status(&ctx);
+        if let Ok(data) = bincode::serialize(&my_status) {
             let encrypted = send_cipher.lock().unwrap().encrypt(&data);
             let len = (encrypted.len() as u32).to_be_bytes();
             let mut packet = Vec::with_capacity(4 + encrypted.len());
             packet.extend_from_slice(&len);
             packet.extend_from_slice(&encrypted);
-            if tokio::io::AsyncWriteExt::write_all(&mut writer, &packet).await.is_err() {
-                break;
+            if tokio::io::AsyncWriteExt::write_all(&mut stream, &packet).await.is_ok() {
+                tracing::info!("📤 Status sent to {}", hex::encode(&peer_id));
+        tracing::info!("[ATP] Client entering read loop...");
+        tracing::info!("[ATP] Client waiting for data...");
             }
+        }
+
+        let my_height = ctx.validator.lock().unwrap().last_block_height();
+        if peer_height < my_height {
+            let all_blocks: Vec<(u64, Vec<u8>)> = {
+                let st = ctx.storage.lock().unwrap();
+                let mut blocks = Vec::new();
+                for h in (peer_height + 1)..=my_height {
+                    if let Ok(Some(b)) = st.load_block(h) {
+                        if let Ok(block_bytes) = bincode::serialize(&b) { blocks.push((h, block_bytes)); }
+                    }
+                }
+                blocks
+            };
+            for chunk in all_blocks.chunks(100) {
+                let resp = AtpMessage::BlockResponse { request_id: u64::MAX, blocks: chunk.to_vec() };
+                if let Ok(data) = bincode::serialize(&resp) {
+                    let enc = send_cipher.lock().unwrap().encrypt(&data);
+                    let l = (enc.len() as u32).to_be_bytes();
+                    let mut pkt = Vec::with_capacity(4 + enc.len());
+                    pkt.extend_from_slice(&l);
+                    pkt.extend_from_slice(&enc);
+                    if tokio::io::AsyncWriteExt::write_all(&mut stream, &pkt).await.is_err() { break; }
+                }
+            }
+            tracing::info!("📤 Blocks sent to {}", hex::encode(&peer_id));
+        }
+    } else {
+        // КЛИЕНТ: отправляем статус → читаем ответы
+        let my_status = create_status(&ctx);
+        if let Ok(data) = bincode::serialize(&my_status) {
+            let encrypted = send_cipher.lock().unwrap().encrypt(&data);
+            let len = (encrypted.len() as u32).to_be_bytes();
+            let mut packet = Vec::with_capacity(4 + encrypted.len());
+            packet.extend_from_slice(&len);
+            packet.extend_from_slice(&encrypted);
+            if tokio::io::AsyncWriteExt::write_all(&mut stream, &packet).await.is_ok() {
+                tracing::info!("📤 Status sent to {}", hex::encode(&peer_id));
+        tracing::info!("[ATP] Client entering read loop...");
+        tracing::info!("[ATP] Client waiting for data...");
+            }
+        }
+
+        loop {
+            let response = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut len_buf = [0u8; 4];
+                tokio::io::AsyncReadExt::read_exact(&mut stream, &mut len_buf).await?;
+                let len = u32::from_be_bytes(len_buf) as usize;
+                    tracing::info!("[ATP] Client read len: {}", len);
+                if len > 10 * 1024 * 1024 {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "too large"));
+                }
+                let mut encrypted = vec![0u8; len];
+                tokio::io::AsyncReadExt::read_exact(&mut stream, &mut encrypted).await?;
+                Ok::<Vec<u8>, std::io::Error>(encrypted)
+            }).await;
+
+            match response {
+                Ok(Ok(encrypted)) => {
+                    if let Some(plaintext) = recv_cipher.lock().unwrap().decrypt(&encrypted) {
+                        if let Ok(msg) = bincode::deserialize::<AtpMessage>(&plaintext) {
+                            match &msg {
+                                AtpMessage::Status { .. } => {
+                                    tracing::info!("📊 Peer status received from {}", hex::encode(&peer_id));
+                                    handle_atp_message(msg, &ctx, &peer_id, &peers);
+                                }
+                                AtpMessage::BlockResponse { .. } => {
+                                    handle_atp_message(msg, &ctx, &peer_id, &peers);
+                                }
+                                _ => { handle_atp_message(msg, &ctx, &peer_id, &peers); break; }
+                            }
+                        }
+                    }
+                }
+                Ok(Err(e)) => { tracing::warn!("Handshake read error: {}", e); peers.remove_peer(&peer_id); return; }
+                Err(_) => break,
+            }
+        }
+    }
+
+    // ФАЗА 3
+    let stream = Arc::new(tokio::sync::Mutex::new(stream));
+    let send_stream = stream.clone();
+    let send_c = send_cipher.clone();
+    let send_handle = tokio::spawn(async move {
+        let mut rx = rx;
+        while let Some(data) = rx.recv().await {
+            let encrypted = send_c.lock().unwrap().encrypt(&data);
+            let len = (encrypted.len() as u32).to_be_bytes();
+            let mut packet = Vec::with_capacity(4 + encrypted.len());
+            packet.extend_from_slice(&len);
+            packet.extend_from_slice(&encrypted);
+            let mut s = send_stream.lock().await;
+            if tokio::io::AsyncWriteExt::write_all(&mut *s, &packet).await.is_err() { break; }
         }
     });
 
-    let recv_cipher = cipher.clone();
+    let recv_stream = stream.clone();
+    let recv_c = recv_cipher.clone();
     let recv_peers = peers.clone();
     let recv_ctx = ctx.clone();
     let recv_handle = tokio::spawn(async move {
         let mut len_buf = [0u8; 4];
         loop {
-            if tokio::io::AsyncReadExt::read_exact(&mut reader, &mut len_buf).await.is_err() {
-                break;
-            }
+            let mut s = recv_stream.lock().await;
+            if tokio::io::AsyncReadExt::read_exact(&mut *s, &mut len_buf).await.is_err() { break; }
             let len = u32::from_be_bytes(len_buf) as usize;
+                    tracing::info!("[ATP] Client read len: {}", len);
             if len > 10 * 1024 * 1024 { break; }
             let mut encrypted = vec![0u8; len];
-            if tokio::io::AsyncReadExt::read_exact(&mut reader, &mut encrypted).await.is_err() {
-                break;
-            }
-            if let Some(plaintext) = recv_cipher.lock().unwrap().decrypt(&encrypted) {
+            if tokio::io::AsyncReadExt::read_exact(&mut *s, &mut encrypted).await.is_err() { break; }
+            drop(s);
+            if let Some(plaintext) = recv_c.lock().unwrap().decrypt(&encrypted) {
                 if let Ok(msg) = bincode::deserialize::<AtpMessage>(&plaintext) {
                     handle_atp_message(msg, &recv_ctx, &peer_id, &recv_peers);
                 }
