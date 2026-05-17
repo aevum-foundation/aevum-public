@@ -1,0 +1,265 @@
+use aevum::consensus::validator::Validator;
+use aevum::core::block::Block;
+use aevum::core::transaction::Transaction;
+use crate::mempool::Mempool;
+use crate::storage::Storage;
+use crate::sync::ChainSync;
+use libp2p::{
+    core::upgrade,
+    futures::StreamExt,
+    gossipsub::{self, IdentTopic},
+    identify, identity, noise,
+    request_response::{self, ProtocolSupport},
+    swarm::{NetworkBehaviour, Swarm, SwarmEvent},
+    tcp, yamux, Multiaddr, PeerId, Transport,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet, BTreeMap};
+use std::error::Error;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
+
+const MAX_BLOCKS_PER_REQUEST: u64 = 500;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum P2pMessage {
+    Status { height: u64, poh_tick: u64, state_root: [u8; 32], total_supply: u64 },
+    BlockRequest { from: u64, to: u64 },
+    BlockResponse { height: u64, block_bytes: Vec<u8> },
+    Transaction(Vec<u8>),
+}
+
+#[derive(NetworkBehaviour)]
+struct AevumBehaviour {
+    identify: identify::Behaviour,
+    ping: libp2p::ping::Behaviour,
+    gossipsub: gossipsub::Behaviour,
+    adp: request_response::Behaviour<P2pMessage, P2pMessage>,
+}
+
+pub struct P2pHandle {
+    pub sender: crossbeam::channel::Sender<P2pCommand>,
+}
+
+#[derive(Debug)]
+pub enum P2pCommand {
+    BroadcastTransaction(Vec<u8>),
+}
+
+pub struct NodeContext {
+    pub validator: Arc<StdMutex<Validator>>,
+    pub mempool: Arc<StdMutex<Mempool>>,
+    pub storage: Arc<StdMutex<Storage>>,
+    pub chain_sync: Arc<StdMutex<ChainSync>>,
+    pub peer_count: Arc<StdMutex<usize>>,
+    /// Буфер реордеринга блоков: height → block_bytes
+    pub block_buffer: Arc<StdMutex<BTreeMap<u64, Vec<u8>>>>,
+}
+
+pub struct P2pNode {
+    connected_peers: Arc<StdMutex<HashSet<PeerId>>>,
+    bootstrap_peers: Vec<String>,
+    listen_addr: String,
+    context: Arc<NodeContext>,
+}
+
+impl P2pNode {
+    const TX_TOPIC: &'static str = "aevum/transactions/v1";
+
+    pub async fn new(listen_addr: &str, bootstrap_peers: Vec<String>, context: Arc<NodeContext>) -> Result<(Self, P2pHandle), Box<dyn Error>> {
+        let (cmd_tx, _) = crossbeam::channel::unbounded();
+        let node = P2pNode { connected_peers: Arc::new(StdMutex::new(HashSet::new())), bootstrap_peers, listen_addr: listen_addr.to_string(), context };
+        let handle = P2pHandle { sender: cmd_tx };
+        Ok((node, handle))
+    }
+
+    pub fn start(self) -> P2pHandle {
+        let listen_addr = self.listen_addr.clone();
+        let bootstrap = self.bootstrap_peers.clone();
+        let peers = self.connected_peers.clone();
+        let ctx = self.context.clone();
+        let (internal_cmd_tx, internal_cmd_rx) = crossbeam::channel::unbounded::<P2pCommand>();
+        let handle = P2pHandle { sender: internal_cmd_tx.clone() };
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async move {
+                let id_keys = identity::Keypair::generate_ed25519();
+                let peer_id = PeerId::from(id_keys.public());
+                tracing::info!("[ADP] Local peer id: {peer_id}");
+
+                let gossipsub_config = gossipsub::ConfigBuilder::default()
+                    .heartbeat_interval(Duration::from_secs(1))
+                    .validation_mode(gossipsub::ValidationMode::Strict)
+                    .mesh_n_low(1).mesh_n_high(4).mesh_outbound_min(1)
+                    .build().expect("Valid gossipsub config");
+
+                let mut gossipsub = gossipsub::Behaviour::new(
+                    gossipsub::MessageAuthenticity::Signed(id_keys.clone()),
+                    gossipsub_config,
+                ).expect("Valid gossipsub behaviour");
+
+                let tx_topic = IdentTopic::new(Self::TX_TOPIC);
+                gossipsub.subscribe(&tx_topic).ok();
+
+                let behaviour = AevumBehaviour {
+                    identify: identify::Behaviour::new(identify::Config::new("/aevum/1.0.0".to_string(), id_keys.public()).with_agent_version("aevum-node/0.1.0".to_string())),
+                    ping: libp2p::ping::Behaviour::new(libp2p::ping::Config::new().with_interval(Duration::from_secs(15))),
+                    gossipsub,
+                    adp: request_response::Behaviour::new(
+                        [(P2pMessage::Status { height: 0, poh_tick: 0, state_root: [0; 32], total_supply: 0 }, ProtocolSupport::Full)],
+                        request_response::Config::default(),
+                    ),
+                };
+
+                let transport = tcp::tokio::Transport::default()
+                    .upgrade(upgrade::Version::V1).authenticate(noise::Config::new(&id_keys).expect("Noise"))
+                    .multiplex(yamux::Config::default()).timeout(Duration::from_secs(30)).boxed();
+
+                let mut swarm = Swarm::new(transport, behaviour, peer_id,
+                    libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(Duration::from_secs(60)));
+                swarm.listen_on(listen_addr.parse().unwrap()).unwrap();
+                tracing::info!("[ADP] Listening on {}", listen_addr);
+
+                for addr in &bootstrap { if let Ok(ma) = addr.parse::<Multiaddr>() { swarm.dial(ma).ok(); } }
+
+                loop {
+                    tokio::select! {
+                        event = swarm.select_next_some() => {
+                            match event {
+                                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                                    tracing::info!("✅ CONNECTED to {}", peer_id);
+                                    peers.lock().unwrap().insert(peer_id);
+                                    *ctx.peer_count.lock().unwrap() = peers.lock().unwrap().len();
+                                    let val = ctx.validator.lock().unwrap();
+                                    let msg = P2pMessage::Status {
+                                        height: val.last_block_height(), poh_tick: val.poh().current_tick_number(),
+                                        state_root: val.utxo_set().state_root().0, total_supply: val.utxo_set().total_supply(),
+                                    };
+                                    drop(val);
+                                    swarm.behaviour_mut().adp.send_request(&peer_id, msg);
+                                }
+                                SwarmEvent::ConnectionClosed { peer_id, .. } => { peers.lock().unwrap().remove(&peer_id); }
+                                SwarmEvent::Behaviour(AevumBehaviourEvent::Adp(event)) => {
+                                    match event {
+                                        request_response::Event::Message { message, .. } => {
+                                            match message {
+                                                request_response::Message::Request { request, channel, .. } => {
+                                                    match request {
+                                                        P2pMessage::Status { height, .. } => {
+                                                            let my = ctx.validator.lock().unwrap().last_block_height();
+                                                            tracing::info!("📊 Peer height: {}, my: {}", height, my);
+                                                            let val = ctx.validator.lock().unwrap();
+                                                            let resp = P2pMessage::Status {
+                                                                height: val.last_block_height(), poh_tick: val.poh().current_tick_number(),
+                                                                state_root: val.utxo_set().state_root().0, total_supply: val.utxo_set().total_supply(),
+                                                            };
+                                                            drop(val);
+                                                            let _ = swarm.behaviour_mut().adp.send_response(channel, resp);
+                                                            if height > my {
+                                                                let to = (my + 1 + MAX_BLOCKS_PER_REQUEST).min(height);
+                                                                let req = P2pMessage::BlockRequest { from: my + 1, to };
+                                                                swarm.behaviour_mut().adp.send_request(&peer_id, req);
+                                                            }
+                                                        }
+                                                        P2pMessage::BlockRequest { from, to } => {
+                                                            tracing::info!("📥 Block request: {}-{}", from, to);
+                                                            let st = ctx.storage.lock().unwrap();
+                                                            for h in from..=to {
+                                                                if let Ok(Some(b)) = st.load_block(h) {
+                                                                    if let Ok(block_bytes) = bincode::serialize(&b) {
+                                                                        let resp = P2pMessage::BlockResponse { height: h, block_bytes };
+                                                                        let _ = swarm.behaviour_mut().adp.send_response(channel, resp);
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+                                                request_response::Message::Response { response, .. } => {
+                                                    match response {
+                                                        P2pMessage::Status { height, .. } => {
+                                                            let my = ctx.validator.lock().unwrap().last_block_height();
+                                                            if height > my {
+                                                                let to = (my + 1 + MAX_BLOCKS_PER_REQUEST).min(height);
+                                                                let req = P2pMessage::BlockRequest { from: my + 1, to };
+                                                                swarm.behaviour_mut().adp.send_request(&peer_id, req);
+                                                            }
+                                                        }
+                                                        P2pMessage::BlockResponse { height, block_bytes } => {
+                                                            // Кладём в буфер реордеринга
+                                                            ctx.block_buffer.lock().unwrap().insert(height, block_bytes);
+                                                            // Пытаемся применить все последовательные блоки из буфера
+                                                            Self::flush_block_buffer(&ctx);
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                SwarmEvent::Behaviour(AevumBehaviourEvent::Gossipsub(gossipsub::Event::Message { message, .. })) => {
+                                    if let Ok(P2pMessage::Transaction(bytes)) = serde_json::from_slice(&message.data) {
+                                        if let Ok(tx) = bincode::deserialize::<Transaction>(&bytes) { ctx.mempool.lock().unwrap().insert(tx).ok(); }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                            let val = ctx.validator.lock().unwrap();
+                            let msg = P2pMessage::Status {
+                                height: val.last_block_height(), poh_tick: val.poh().current_tick_number(),
+                                state_root: val.utxo_set().state_root().0, total_supply: val.utxo_set().total_supply(),
+                            };
+                            drop(val);
+                            let p = peers.lock().unwrap().clone();
+                            for pid in &p { swarm.behaviour_mut().adp.send_request(pid, msg.clone()); }
+                            while let Ok(P2pCommand::BroadcastTransaction(bytes)) = internal_cmd_rx.try_recv() {
+                                let msg = P2pMessage::Transaction(bytes);
+                                if let Ok(data) = serde_json::to_vec(&msg) {
+                                    swarm.behaviour_mut().gossipsub.publish(tx_topic.clone(), data).ok();
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        handle
+    }
+
+    /// Применить все последовательные блоки из буфера
+    fn flush_block_buffer(ctx: &Arc<NodeContext>) {
+        let mut val = ctx.validator.lock().unwrap();
+        let mut st = ctx.storage.lock().unwrap();
+        let mut buffer = ctx.block_buffer.lock().unwrap();
+        
+        let next_height = val.last_block_height() + 1;
+        
+        while let Some(block_bytes) = buffer.remove(&next_height) {
+            if let Ok(block) = bincode::deserialize::<Block>(&block_bytes) {
+                let mut b = block;
+                match val.validate_and_apply(&mut b) {
+                    Ok(_) => {
+                        st.save_block(&b).ok();
+                        st.save_utxo_set(val.utxo_set()).ok();
+                        ctx.chain_sync.lock().unwrap().mark_received(b.height);
+                        tracing::info!("📦 Synced block at height {}", b.height);
+                        // Продолжаем со следующим блоком
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Block {} validation failed: {:?}", next_height, e);
+                        // Пропускаем проблемный блок, пробуем следующий
+                        continue;
+                    }
+                }
+            }
+            break; // Не смогли десериализовать — остановка
+        }
+    }
+}

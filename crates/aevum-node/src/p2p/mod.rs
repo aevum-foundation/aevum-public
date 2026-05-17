@@ -1,0 +1,53 @@
+pub mod framing;
+pub mod gossip;
+pub mod noise;
+pub mod peers;
+pub mod sync;
+
+use aevum::consensus::validator::Validator;
+use crate::mempool::Mempool;
+use crate::storage::Storage;
+use crate::sync::ChainSync;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::collections::HashSet;
+use libp2p::PeerId;
+
+pub struct NodeContext {
+    pub validator: Arc<StdMutex<Validator>>,
+    pub mempool: Arc<StdMutex<Mempool>>,
+    pub storage: Arc<StdMutex<Storage>>,
+    pub chain_sync: Arc<StdMutex<ChainSync>>,
+    pub peer_count: Arc<StdMutex<usize>>,
+}
+
+pub struct P2pNode {
+    connected_peers: Arc<StdMutex<HashSet<PeerId>>>,
+    bootstrap_peers: Vec<String>,
+    listen_addr: String,
+    context: Arc<NodeContext>,
+}
+
+pub struct P2pHandle {
+    pub sender: crossbeam::channel::Sender<P2pCommand>,
+}
+
+#[derive(Debug)]
+pub enum P2pCommand {
+    BroadcastTransaction(Vec<u8>),
+    BroadcastBlock(Vec<u8>),
+}
+
+impl P2pNode {
+    pub async fn new(listen_addr: &str, bootstrap_peers: Vec<String>, context: Arc<NodeContext>) -> Result<(Self, P2pHandle), Box<dyn std::error::Error>> {
+        let (cmd_tx, _) = crossbeam::channel::unbounded();
+        let node = P2pNode { connected_peers: Arc::new(StdMutex::new(HashSet::new())), bootstrap_peers, listen_addr: listen_addr.to_string(), context };
+        let handle = P2pHandle { sender: cmd_tx };
+        Ok((node, handle))
+    }
+
+    pub fn start(self) -> P2pHandle {
+        // ATP запуск через отдельные модули
+        let (cmd_tx, _) = crossbeam::channel::unbounded();
+        P2pHandle { sender: cmd_tx }
+    }
+}
