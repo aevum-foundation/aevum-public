@@ -304,73 +304,60 @@ async fn run_connection(
     let tx_clone = tx.clone();
     peers.register_peer(peer_id, addr, tx);
 
-    let stream = Arc::new(tokio::sync::Mutex::new(stream));
-    let cipher = Arc::new(cipher);
+    let cipher = Arc::new(StdMutex::new(cipher));
+    let (mut reader, mut writer) = tokio::io::split(stream);
 
-    let send_stream = stream.clone();
+    let status = create_status(&ctx);
+    if let Ok(data) = bincode::serialize(&status) {
+        let encrypted = cipher.lock().unwrap().encrypt(&data);
+        let len = (encrypted.len() as u32).to_be_bytes();
+        let mut packet = Vec::with_capacity(4 + encrypted.len());
+        packet.extend_from_slice(&len);
+        packet.extend_from_slice(&encrypted);
+        if tokio::io::AsyncWriteExt::write_all(&mut writer, &packet).await.is_ok() {
+            tracing::info!("📤 Status sent to {}", hex::encode(&peer_id));
+        }
+    }
+
     let send_cipher = cipher.clone();
-    let recv_stream = stream.clone();
+    let send_handle = tokio::spawn(async move {
+        let mut rx = rx;
+        while let Some(data) = rx.recv().await {
+            let encrypted = send_cipher.lock().unwrap().encrypt(&data);
+            let len = (encrypted.len() as u32).to_be_bytes();
+            let mut packet = Vec::with_capacity(4 + encrypted.len());
+            packet.extend_from_slice(&len);
+            packet.extend_from_slice(&encrypted);
+            if tokio::io::AsyncWriteExt::write_all(&mut writer, &packet).await.is_err() {
+                break;
+            }
+        }
+    });
+
     let recv_cipher = cipher.clone();
     let recv_peers = peers.clone();
     let recv_ctx = ctx.clone();
-
-    let connection_handle = tokio::spawn(async move {
-        let mut rx = rx;
+    let recv_handle = tokio::spawn(async move {
         let mut len_buf = [0u8; 4];
         loop {
-            tokio::select! {
-                // Ветка отправки — ПЕРВАЯ, чтобы статус ушёл сразу
-                data = rx.recv() => {
-                    match data {
-                        Some(data) => {
-                            let encrypted = send_cipher.encrypt(&data);
-                            let len = (encrypted.len() as u32).to_be_bytes();
-                            let mut packet = Vec::with_capacity(4 + encrypted.len());
-                            packet.extend_from_slice(&len);
-                            packet.extend_from_slice(&encrypted);
-                            let mut stream = send_stream.lock().await;
-                            if tokio::io::AsyncWriteExt::write_all(&mut *stream, &packet).await.is_err() {
-                                break;
-                            }
-                        }
-                        None => break,
-                    }
-                }
-                // Ветка приёма — ждёт данные из сети
-                result = async {
-                    let mut stream = recv_stream.lock().await;
-                    tokio::io::AsyncReadExt::read_exact(&mut *stream, &mut len_buf).await?;
-                    let len = u32::from_be_bytes(len_buf) as usize;
-                    if len > 10 * 1024 * 1024 {
-                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "too large"));
-                    }
-                    let mut encrypted = vec![0u8; len];
-                    tokio::io::AsyncReadExt::read_exact(&mut *stream, &mut encrypted).await?;
-                    Ok::<Vec<u8>, std::io::Error>(encrypted)
-                } => {
-                    match result {
-                        Ok(encrypted) => {
-                            if let Some(plaintext) = recv_cipher.decrypt(&encrypted) {
-                                if let Ok(msg) = bincode::deserialize::<AtpMessage>(&plaintext) {
-                                    handle_atp_message(msg, &recv_ctx, &peer_id, &recv_peers);
-                                }
-                            }
-                        }
-                        Err(_) => break,
-                    }
+            if tokio::io::AsyncReadExt::read_exact(&mut reader, &mut len_buf).await.is_err() {
+                break;
+            }
+            let len = u32::from_be_bytes(len_buf) as usize;
+            if len > 10 * 1024 * 1024 { break; }
+            let mut encrypted = vec![0u8; len];
+            if tokio::io::AsyncReadExt::read_exact(&mut reader, &mut encrypted).await.is_err() {
+                break;
+            }
+            if let Some(plaintext) = recv_cipher.lock().unwrap().decrypt(&encrypted) {
+                if let Ok(msg) = bincode::deserialize::<AtpMessage>(&plaintext) {
+                    handle_atp_message(msg, &recv_ctx, &peer_id, &recv_peers);
                 }
             }
         }
     });
 
-    // Отправляем статус через канал (rx.recv() в select! сразу его заберёт)
-    let status = create_status(&ctx);
-    if let Ok(data) = bincode::serialize(&status) {
-        let _ = tx_clone.send(data);
-        tracing::info!("📤 Status queued for {}", hex::encode(&peer_id));
-    }
-
-    let _ = connection_handle.await;
+    let _ = tokio::join!(send_handle, recv_handle);
     peers.remove_peer(&peer_id);
     tracing::info!("❌ Disconnected from {}", hex::encode(&peer_id));
 }
