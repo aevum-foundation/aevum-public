@@ -32,3 +32,10 @@ Community
 
 · Telegram: https://t.me/aevumchain
 · Email: aevumaltcoin@gmail.com
+
+## Closed Modules (Optional)
+Closed-source modules (ZK, Prisma, Science) are available as pre-compiled `.so` files.
+Download them separately and place in `modules/` folder.
+The node will automatically load them on startup.
+
+*Modules will be open-sourced when network reaches 10,000+ miners.*
