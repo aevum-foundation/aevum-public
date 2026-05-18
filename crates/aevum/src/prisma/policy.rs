@@ -2,6 +2,7 @@ use crate::core::address::AcceptancePolicy;
 use crate::crypto::hash::Hash;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Policy {
     pub policy: AcceptancePolicy,
     pub policy_hash: Hash,

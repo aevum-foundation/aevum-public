@@ -3,6 +3,7 @@ use crate::crypto::hash::Hash;
 use crate::crypto::keys::PublicKey;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum AcceptancePolicy {
     Whitelist(Vec<AcceptanceRule>),
     Blacklist(Vec<AcceptanceRule>),
@@ -13,6 +14,25 @@ pub enum AcceptancePolicy {
 const ACCEPTANCE_POLICY_FORMAT_VERSION: u8 = 0x01;
 
 impl AcceptancePolicy {
+    pub fn accepts_level(&self, level: u64) -> bool {
+        match self {
+            AcceptancePolicy::AcceptAll => true,
+            AcceptancePolicy::RejectAll => false,
+            AcceptancePolicy::Whitelist(rules) => {
+                rules.iter().any(|rule| match rule {
+                    AcceptanceRule::Level(ref rl) => rl.to_u64() == level,
+                    AcceptanceRule::Jurisdiction(_) => false,
+                })
+            }
+            AcceptancePolicy::Blacklist(rules) => {
+                !rules.iter().any(|rule| match rule {
+                    AcceptanceRule::Level(ref rl) => rl.to_u64() == level,
+                    AcceptanceRule::Jurisdiction(_) => false,
+                })
+            }
+        }
+    }
+
     pub fn serialize(&self) -> Vec<u8> {
         let mut data = vec![ACCEPTANCE_POLICY_FORMAT_VERSION];
         match self {
@@ -21,16 +41,12 @@ impl AcceptancePolicy {
             AcceptancePolicy::Whitelist(rules) => {
                 data.push(0x01);
                 data.push(rules.len() as u8);
-                for rule in rules {
-                    data.extend_from_slice(&rule.serialize());
-                }
+                for rule in rules { data.extend_from_slice(&rule.serialize()); }
             }
             AcceptancePolicy::Blacklist(rules) => {
                 data.push(0x02);
                 data.push(rules.len() as u8);
-                for rule in rules {
-                    data.extend_from_slice(&rule.serialize());
-                }
+                for rule in rules { data.extend_from_slice(&rule.serialize()); }
             }
         }
         data
@@ -38,6 +54,7 @@ impl AcceptancePolicy {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum AcceptanceRule {
     Level(RestrictionLevel),
     Jurisdiction([u8; 4]),
@@ -71,9 +88,7 @@ impl AcceptanceRule {
                 None => {
                     if let RestrictionLevel::Restricted { allowed } = level {
                         allowed.contains(code)
-                    } else {
-                        false
-                    }
+                    } else { false }
                 }
             },
         }
@@ -99,11 +114,7 @@ impl Address {
         hasher.update(public_key.as_bytes());
         hasher.update(&serialized);
         let policy_hash = Hash(hasher.finalize().into());
-        Address {
-            public_key,
-            policy_hash,
-            version: Self::CURRENT_VERSION,
-        }
+        Address { public_key, policy_hash, version: Self::CURRENT_VERSION }
     }
 
     pub fn accepts(
@@ -115,12 +126,8 @@ impl Address {
         match policy {
             AcceptancePolicy::AcceptAll => true,
             AcceptancePolicy::RejectAll => false,
-            AcceptancePolicy::Whitelist(rules) => rules
-                .iter()
-                .any(|rule| rule.matches(level, specific_jurisdiction)),
-            AcceptancePolicy::Blacklist(rules) => !rules
-                .iter()
-                .any(|rule| rule.matches(level, specific_jurisdiction)),
+            AcceptancePolicy::Whitelist(rules) => rules.iter().any(|rule| rule.matches(level, specific_jurisdiction)),
+            AcceptancePolicy::Blacklist(rules) => !rules.iter().any(|rule| rule.matches(level, specific_jurisdiction)),
         }
     }
 }
@@ -129,14 +136,9 @@ impl Address {
 mod tests {
     use super::*;
 
-    fn alice_key() -> PublicKey {
-        crate::crypto::keys::PrivateKey::generate().public_key()
-    }
-    fn check_accepts(
-        policy: &AcceptancePolicy,
-        level: &RestrictionLevel,
-        specific_jurisdiction: Option<&[u8; 4]>,
-    ) -> bool {
+    fn alice_key() -> PublicKey { crate::crypto::keys::PrivateKey::generate().public_key() }
+    
+    fn check_accepts(policy: &AcceptancePolicy, level: &RestrictionLevel, specific_jurisdiction: Option<&[u8; 4]>) -> bool {
         let addr = Address::new(PublicKey::dummy(), policy);
         addr.accepts(policy, level, specific_jurisdiction)
     }
@@ -144,86 +146,61 @@ mod tests {
     #[test]
     fn address_creation_consistent_hash() {
         let pk = alice_key();
-        let p =
-            AcceptancePolicy::Whitelist(vec![AcceptanceRule::Level(RestrictionLevel::GlobalClean)]);
-        assert_eq!(
-            Address::new(pk.clone(), &p).policy_hash,
-            Address::new(pk, &p).policy_hash
-        );
+        let p = AcceptancePolicy::Whitelist(vec![AcceptanceRule::Level(RestrictionLevel::GlobalClean)]);
+        assert_eq!(Address::new(pk.clone(), &p).policy_hash, Address::new(pk, &p).policy_hash);
     }
 
     #[test]
     fn different_policy_different_hash() {
         let pk = alice_key();
-        assert_ne!(
-            Address::new(pk.clone(), &AcceptancePolicy::AcceptAll).policy_hash,
-            Address::new(pk, &AcceptancePolicy::RejectAll).policy_hash
-        );
+        assert_ne!(Address::new(pk.clone(), &AcceptancePolicy::AcceptAll).policy_hash, Address::new(pk, &AcceptancePolicy::RejectAll).policy_hash);
     }
 
     #[test]
     fn whitelist_accepts_matching_level() {
-        let p =
-            AcceptancePolicy::Whitelist(vec![AcceptanceRule::Level(RestrictionLevel::GlobalClean)]);
+        let p = AcceptancePolicy::Whitelist(vec![AcceptanceRule::Level(RestrictionLevel::GlobalClean)]);
         assert!(check_accepts(&p, &RestrictionLevel::GlobalClean, None));
     }
 
     #[test]
     fn whitelist_rejects_non_matching_level() {
-        let p =
-            AcceptancePolicy::Whitelist(vec![AcceptanceRule::Level(RestrictionLevel::GlobalClean)]);
+        let p = AcceptancePolicy::Whitelist(vec![AcceptanceRule::Level(RestrictionLevel::GlobalClean)]);
         assert!(!check_accepts(&p, &RestrictionLevel::ProvenanceNull, None));
     }
 
     #[test]
     fn blacklist_rejects_listed_level() {
-        let p = AcceptancePolicy::Blacklist(vec![AcceptanceRule::Level(
-            RestrictionLevel::ProvenanceNull,
-        )]);
+        let p = AcceptancePolicy::Blacklist(vec![AcceptanceRule::Level(RestrictionLevel::ProvenanceNull)]);
         assert!(!check_accepts(&p, &RestrictionLevel::ProvenanceNull, None));
     }
 
     #[test]
     fn blacklist_accepts_unlisted_level() {
-        let p = AcceptancePolicy::Blacklist(vec![AcceptanceRule::Level(
-            RestrictionLevel::ProvenanceNull,
-        )]);
+        let p = AcceptancePolicy::Blacklist(vec![AcceptanceRule::Level(RestrictionLevel::ProvenanceNull)]);
         assert!(check_accepts(&p, &RestrictionLevel::GlobalClean, None));
     }
 
     #[test]
     fn accept_all_always_accepts() {
-        assert!(check_accepts(
-            &AcceptancePolicy::AcceptAll,
-            &RestrictionLevel::ProvenanceNull,
-            None
-        ));
+        assert!(check_accepts(&AcceptancePolicy::AcceptAll, &RestrictionLevel::ProvenanceNull, None));
     }
 
     #[test]
     fn reject_all_always_rejects() {
-        assert!(!check_accepts(
-            &AcceptancePolicy::RejectAll,
-            &RestrictionLevel::GlobalClean,
-            None
-        ));
+        assert!(!check_accepts(&AcceptancePolicy::RejectAll, &RestrictionLevel::GlobalClean, None));
     }
 
     #[test]
     fn jurisdiction_rule_matches_restricted_utxo() {
         let p = AcceptancePolicy::Whitelist(vec![AcceptanceRule::Jurisdiction(*b"NLOK")]);
-        let l = RestrictionLevel::Restricted {
-            allowed: vec![*b"NLOK", *b"DEOK"],
-        };
+        let l = RestrictionLevel::Restricted { allowed: vec![*b"NLOK", *b"DEOK"] };
         assert!(check_accepts(&p, &l, None));
     }
 
     #[test]
     fn jurisdiction_rule_rejects_non_matching() {
         let p = AcceptancePolicy::Whitelist(vec![AcceptanceRule::Jurisdiction(*b"USOK")]);
-        let l = RestrictionLevel::Restricted {
-            allowed: vec![*b"NLOK"],
-        };
+        let l = RestrictionLevel::Restricted { allowed: vec![*b"NLOK"] };
         assert!(!check_accepts(&p, &l, None));
     }
 }

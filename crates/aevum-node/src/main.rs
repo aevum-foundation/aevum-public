@@ -259,7 +259,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut serial = sc.lock().unwrap(); *serial += 2;
                     let coinbase = Economics::create_coinbase(&mk.public_key(), height, total_fees, &dam, *serial, poh);
                     txs.insert(0, coinbase);
-                    let mut block = Block::new(val.last_block_hash(), height, poh, poh + TICKS_PER_BLOCK, txs, val.utxo_set().state_root(), val.utxo_set().total_supply() + total_fees, None);
+                    let mut block = Block::new(val.last_block_hash(), height, poh, poh + TICKS_PER_BLOCK, txs, val.utxo_set().get_state_root(), val.utxo_set().total_supply() + total_fees, None);
                     if val.validate_and_apply(&mut block).is_ok() {
                         st.save_block(&block).ok(); if let Err(e) = st.save_utxo_set(val.utxo_set()) { tracing::error!("Failed to save UTXO: {}", e); }
                         let _ = bincode::serialize(&val.poh_snapshot()).ok().and_then(|s| st.save_metadata(POH_SNAPSHOT_KEY, &s).ok());

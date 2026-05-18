@@ -122,7 +122,7 @@ pub fn create_status(ctx: &SyncContext) -> AtpMessage {
     AtpMessage::Status {
         height: val.last_block_height(),
         poh_tick: val.poh().current_tick_number(),
-        state_root: val.utxo_set().state_root().0,
+        state_root: val.utxo_set().get_state_root().0,
         total_supply: val.utxo_set().total_supply(),
         version: 1, capabilities: 0x01,
     }

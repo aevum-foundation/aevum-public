@@ -31,21 +31,21 @@ impl Validator {
         self.poh.tick();
     }
 
-    pub fn validate_and_apply(&mut self, block: &mut Block) -> Result<(), &'static str> {
+    pub fn validate_and_apply(&mut self, block: &mut Block) -> Result<(), Box<dyn std::error::Error>> {
         if !block.is_internal_valid() {
-            return Err("Block internal validation failed");
+            return Err("Block internal validation failed".into());
         }
 
         // Проверка полезного решения
         if let Some(ref solution) = block.useful_solution {
             if !solution.verify() {
-                return Err("Invalid useful solution");
+                return Err("Invalid useful solution".into());
             }
         }
 
         if block.is_genesis() {
             if self.genesis_applied {
-                return Err("Genesis already applied");
+                return Err("Genesis already applied".into());
             }
             let new_root = self.utxo_set.apply_block(block)?;
             block.state_root = new_root;
@@ -61,16 +61,16 @@ impl Validator {
         }
 
         if !self.genesis_applied {
-            return Err("Genesis not applied yet");
+            return Err("Genesis not applied yet".into());
         }
         if block.prev_hash != self.last_block_hash {
-            return Err("Block prev_hash mismatch");
+            return Err("Block prev_hash mismatch".into());
         }
         if block.height != self.last_block_height + 1 {
-            return Err("Block height mismatch");
+            return Err("Block height mismatch".into());
         }
         if block.poh_tick_start < self.last_poh_tick_end {
-            return Err("PoH tick overlap");
+            return Err("PoH tick overlap".into());
         }
 
         while self.poh.current_tick_number() < block.poh_tick_start {
@@ -91,31 +91,31 @@ impl Validator {
 
     pub fn pre_validate(&self, block: &Block) -> Result<(), &'static str> {
         if !block.is_internal_valid() {
-            return Err("Block internal validation failed");
+            return Err("Block internal validation failed".into());
         }
         if let Some(ref solution) = block.useful_solution {
             if !solution.verify() {
-                return Err("Invalid useful solution");
+                return Err("Invalid useful solution".into());
             }
         }
         if block.is_genesis() {
             return if self.genesis_applied {
-                Err("Genesis already applied")
+                Err("Genesis already applied".into())
             } else {
                 Ok(())
             };
         }
         if !self.genesis_applied {
-            return Err("Genesis not applied yet");
+            return Err("Genesis not applied yet".into());
         }
         if block.prev_hash != self.last_block_hash {
-            return Err("Block prev_hash mismatch");
+            return Err("Block prev_hash mismatch".into());
         }
         if block.height != self.last_block_height + 1 {
-            return Err("Block height mismatch");
+            return Err("Block height mismatch".into());
         }
         if block.poh_tick_start < self.last_poh_tick_end {
-            return Err("PoH tick overlap");
+            return Err("PoH tick overlap".into());
         }
         Ok(())
     }
