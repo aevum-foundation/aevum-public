@@ -41,7 +41,7 @@ pub fn is_risk_tag(level: u64) -> bool { level & CATEGORY_MASK == CAT_RISK_TAG }
 pub fn is_spendable(level: u64, h: u64, ch: u64, m: u64) -> bool { if is_coinbase(level) { h.saturating_sub(ch) >= m } else { true } }
 pub fn get_risk_subcategory(level: u64) -> u64 { (level & SUBCATEGORY_MASK) >> 4 }
 pub fn get_jurisdiction_code(level: u64) -> u8 { (level & JURISDICTION_MASK) as u8 }
-pub fn decay_taint(td: u16, tt: u64, ch: u64) -> u16 { td.saturating_sub((ch.saturating_sub(tt) / TAINT_DECAY_INTERVAL) as u16) }
+pub fn decay_taint(td: u16, tt: u64, ch: u64) -> u16 { if tt == 0 || ch <= tt { return td; } td.saturating_sub(((ch - tt) / TAINT_DECAY_INTERVAL) as u16) }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RestrictionLevel { GlobalClean, Restricted { allowed: Vec<JurisdictionCode> }, ProvenanceNull }

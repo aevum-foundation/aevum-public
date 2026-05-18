@@ -121,7 +121,10 @@ impl UtxoSet {
 #[cfg(test)]
 mod tests {
     use super::*; use crate::core::address::AcceptancePolicy; use crate::core::transaction::{Transaction, TxInput, TxOutput}; use crate::crypto::keys::PublicKey;
-    fn dummy_utxo(s: u64) -> JtUtxo { JtUtxo::new_global_clean(PublicKey::dummy(), 100, &[1u8;32], &[1u8;32], s, 1, Hash::zero()).expect("dummy") }
+    fn dummy_utxo(s: u64) -> JtUtxo {
+        let kp = crate::crypto::keys::Keypair::generate();
+        JtUtxo::new_global_clean(kp.public, 100, &[1u8;32], &[1u8;32], s, 1, Hash::zero()).expect("dummy")
+    }
     #[test] fn empty_ok() { let mut s=UtxoSet::new(); let cb=Transaction::new(vec![],vec![],0); assert!(s.apply_block(&Block::new(Hash::zero(),1,0,10,vec![cb],Hash::zero(),0,None)).is_ok()); }
     #[test] fn no_cb() { assert_eq!(UtxoSet::new().apply_block(&Block::new(Hash::zero(),1,0,10,vec![],Hash::zero(),0,None)), Err(UtxoSetError::NoCoinbase)); }
     #[test] fn multi_cb() { let a=Transaction::new(vec![],vec![],0); let b=Transaction::new(vec![],vec![],0); assert_eq!(UtxoSet::new().apply_block(&Block::new(Hash::zero(),1,0,10,vec![a,b],Hash::zero(),0,None)), Err(UtxoSetError::MultipleCoinbase)); }

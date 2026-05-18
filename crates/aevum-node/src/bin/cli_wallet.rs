@@ -5,6 +5,7 @@ use aevum::core::state::UtxoSet;
 use aevum::crypto::keys::{PrivateKey, PublicKey};
 use aevum::crypto::hash::Hash;
 use aevum::prisma::policy::Policy;
+use aevum::prisma::filter::PrismaFilter;
 use aevum::wallet::{Wallet, Mnemonic};
 use aevum_node::storage::Storage;
 use std::io::Write;
@@ -41,6 +42,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "import" => cmd_import(&args)?,
         "encrypt-key" => cmd_encrypt_key(&args)?,
         "decrypt-key" => cmd_decrypt_key(&args)?,
+        "cross-chain-check" => cmd_cross_chain_check(&args, &db_path)?,
         "risk-check" => cmd_risk_check(&args, &db_path)?,
         "prove-innocence" => cmd_prove_innocence(&args, &db_path)?,
         "verify-innocence" => cmd_verify_innocence(&args)?,
@@ -66,6 +68,7 @@ fn print_help() {
     println!("  decrypt-key --encrypted-file <ФАЙЛ> --password <ПАРОЛЬ>");
     println!("  prisma-config --address <АДРЕС> [--accept US,EU] [--block KP,IR] [--default-allow|--default-deny] [--show] --db <ПУТЬ>");
     println!("  risk-check --address <АДРЕС> --db <ПУТЬ>");
+    println!("  cross-chain-check --chain <BITCOIN|ETHEREUM> --address <АДРЕС> --db <ПУТЬ>");
     println!("  prove-innocence --address <АДРЕС> --oracle-pubkey <КЛЮЧ> --db <ПУТЬ>");
     println!("  verify-innocence --proof <ФАЙЛ>");
     println!("  genesis-info --db <ПУТЬ>");
@@ -283,6 +286,22 @@ fn cmd_history(args: &[String], db_path: &PathBuf) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+fn cmd_cross_chain_check(args: &[String], db_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let chain = args.iter().position(|a| a == "--chain").and_then(|i| args.get(i + 1)).ok_or("--chain required")?;
+    let addr = args.iter().position(|a| a == "--address").and_then(|i| args.get(i + 1)).ok_or("--address required")?;
+    let chain_id = match chain.to_uppercase().as_str() { "BITCOIN"|"BTC" => 0u32, "ETHEREUM"|"ETH" => 1, _ => return Err("Поддерживаются: Bitcoin, Ethereum".into()) };
+    let storage = Storage::open(db_path)?;
+    let h = storage.max_height()?.unwrap_or(0);
+    let risk = aevum::oracle::innocence::CrossChainRisk::new(chain_id, addr, h);
+    println!("Кросс-чейн проверка: {}:{}", chain, addr);
+    println!("├─ Сеть: {}", chain);
+    println!("├─ Риск: {:.8}", risk.risk_level as f64);
+    println!("├─ Taint: {} хопов", risk.source_taint_distance);
+    println!("├─ Описание: {}", risk.taint_origin_description);
+    println!("├─ Оракулов: {}", risk.confirmed_by.len());
+    println!("└─ Статус: {}", if risk.risk_level == aevum::core::jt_utxo::CAT_GLOBAL { "✅ Чистый" } else { "⚠️  Требует проверки" });
+    Ok(())
+}
 fn cmd_risk_check(args: &[String], db_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let addr = parse_hex_arg(args, "--address")?;
     let pk = validate_public_key(&addr, "адрес")?;
@@ -353,21 +372,35 @@ fn cmd_prisma_config(args: &[String], db_path: &PathBuf) -> Result<(), Box<dyn s
     let addr = parse_hex_arg(args, "--address")?; let pk = validate_public_key(&addr, "адрес")?;
     let mut storage = Storage::open(db_path)?;
     let mut utxos = storage.load_utxo_set().unwrap_or_else(|_| UtxoSet::new());
-    if args.iter().any(|a| a == "--show") {
-        match utxos.get_prisma_policy(&pk) {
-            Some(pol) => { println!("Prisma Filter:"); match &pol.policy { AcceptancePolicy::AcceptAll=>println!("├─ Принимать все"), AcceptancePolicy::RejectAll=>println!("├─ Отклонять все"), AcceptancePolicy::Whitelist(r)=> { println!("├─ Белый список:"); for rl in r { println!("│  ├─ {:?}", rl); } } AcceptancePolicy::Blacklist(r)=> { println!("├─ Чёрный список:"); for rl in r { println!("│  ├─ {:?}", rl); } } } }
-            None => { println!("Prisma Filter не установлен."); }
-        }
-        return Ok(());
-    }
-    let mut pol = AcceptancePolicy::AcceptAll;
-    if args.iter().any(|a| a == "--default-deny") { pol = AcceptancePolicy::RejectAll; }
-    if let Some(codes) = parse_jurisdiction_list(args, "--accept") { pol = AcceptancePolicy::Whitelist(codes.iter().map(|c| AcceptanceRule::Jurisdiction(*c)).collect()); }
-    if let Some(codes) = parse_jurisdiction_list(args, "--block") { pol = AcceptancePolicy::Blacklist(codes.iter().map(|c| AcceptanceRule::Jurisdiction(*c)).collect()); }
-    let pp = Policy::new(pol);
-    utxos.set_prisma_policy(&pk, pp.clone());
+    let mut filter = utxos.get_prisma_policy(&pk).map(|p| PrismaFilter { policy: p.policy.clone(), ..PrismaFilter::default() }).unwrap_or_default();
+    if args.iter().any(|a| a == "--show") { show_prisma_filter(&filter); return Ok(()); }
+    if args.iter().any(|a| a == "--accept-all") { filter.policy = AcceptancePolicy::AcceptAll; }
+    if args.iter().any(|a| a == "--reject-all") { filter.policy = AcceptancePolicy::RejectAll; }
+    if let Some(codes) = parse_jurisdiction_list(args, "--accept") { filter.policy = AcceptancePolicy::Whitelist(codes.iter().map(|c| AcceptanceRule::Jurisdiction(*c)).collect()); }
+    if let Some(codes) = parse_jurisdiction_list(args, "--block") { filter.policy = AcceptancePolicy::Blacklist(codes.iter().map(|c| AcceptanceRule::Jurisdiction(*c)).collect()); }
+    if let Some(max_t) = parse_optional_u64(args, "--max-taint") { filter.max_taint_distance = max_t as u16; }
+    if args.iter().any(|a| a == "--taint-decay-off") { filter.taint_decay_enabled = false; }
+    if args.iter().any(|a| a == "--taint-decay-on") { filter.taint_decay_enabled = true; }
+    if let Some(w) = parse_optional_u64(args, "--weight-sanctions") { filter.set_category_weight(0x010, w as u8); }
+    if let Some(w) = parse_optional_u64(args, "--weight-darknet") { filter.set_category_weight(0x020, w as u8); }
+    if let Some(w) = parse_optional_u64(args, "--weight-ransomware") { filter.set_category_weight(0x030, w as u8); }
+    if let Some(w) = parse_optional_u64(args, "--weight-stolen") { filter.set_category_weight(0x040, w as u8); }
+    if let Some(w) = parse_optional_u64(args, "--weight-scam") { filter.set_category_weight(0x050, w as u8); }
+    if let Some(w) = parse_optional_u64(args, "--weight-mixer") { filter.set_category_weight(0x060, w as u8); }
+    if let Some(t) = parse_optional_u64(args, "--threshold") { filter.category_threshold = t as u8; }
+    if args.iter().any(|a| a == "--require-proof") { filter.require_proof_of_innocence = true; }
+    if args.iter().any(|a| a == "--no-proof") { filter.require_proof_of_innocence = false; }
+    let policy = Policy::new(filter.policy.clone());
+    utxos.set_prisma_policy(&pk, policy);
     storage.save_utxo_set(&utxos)?;
-    println!("✅ Prisma Filter обновлён"); Ok(())
+    println!("✅ Prisma Filter обновлён");
+    show_prisma_filter(&filter);
+    Ok(())
+}
+
+fn show_prisma_filter(filter: &PrismaFilter) {
+    println!("├─ Max Taint: {} | Decay: {} | Threshold: {}% | Proof: {}", filter.max_taint_distance, if filter.taint_decay_enabled {"on"} else {"off"}, filter.category_threshold, if filter.require_proof_of_innocence {"yes"} else {"no"});
+    if !filter.category_weights.is_empty() { for (c,w) in &filter.category_weights { println!("│  ├─ 0x{:03X}: {}%", c, w); } }
 }
 
 fn cmd_create_address() -> Result<(), Box<dyn std::error::Error>> {
