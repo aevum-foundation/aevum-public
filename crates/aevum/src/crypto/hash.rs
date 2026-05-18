@@ -138,3 +138,11 @@ mod tests {
         );
     }
 }
+
+impl AmountCommitment {
+    pub fn dummy() -> Self { AmountCommitment([0u8; 32]) }
+}
+
+impl TagCommitment {
+    pub fn dummy() -> Self { TagCommitment { commitment: [0u8; 32] } }
+}

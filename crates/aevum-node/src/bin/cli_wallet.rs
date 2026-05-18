@@ -41,6 +41,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "import" => cmd_import(&args)?,
         "encrypt-key" => cmd_encrypt_key(&args)?,
         "decrypt-key" => cmd_decrypt_key(&args)?,
+        "risk-check" => cmd_risk_check(&args, &db_path)?,
+        "prove-innocence" => cmd_prove_innocence(&args, &db_path)?,
+        "verify-innocence" => cmd_verify_innocence(&args)?,
         "prisma-config" => cmd_prisma_config(&args, &db_path)?,
         "genesis-info" => cmd_genesis_info(&args, &db_path)?,
         "compute-status" => cmd_compute_status(&args, &db_path)?,
@@ -62,6 +65,9 @@ fn print_help() {
     println!("  encrypt-key --key-file <ФАЙЛ> --password <ПАРОЛЬ>");
     println!("  decrypt-key --encrypted-file <ФАЙЛ> --password <ПАРОЛЬ>");
     println!("  prisma-config --address <АДРЕС> [--accept US,EU] [--block KP,IR] [--default-allow|--default-deny] [--show] --db <ПУТЬ>");
+    println!("  risk-check --address <АДРЕС> --db <ПУТЬ>");
+    println!("  prove-innocence --address <АДРЕС> --oracle-pubkey <КЛЮЧ> --db <ПУТЬ>");
+    println!("  verify-innocence --proof <ФАЙЛ>");
     println!("  genesis-info --db <ПУТЬ>");
     println!("  compute-status --address <АДРЕС> --db <ПУТЬ>");
     println!("  utxos [--address <АДРЕС>] [--limit N] [--offset M] --db <ПУТЬ>");
@@ -277,6 +283,72 @@ fn cmd_history(args: &[String], db_path: &PathBuf) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+fn cmd_risk_check(args: &[String], db_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let addr = parse_hex_arg(args, "--address")?;
+    let pk = validate_public_key(&addr, "адрес")?;
+    let storage = Storage::open(db_path)?;
+    let utxos = storage.load_utxo_set().unwrap_or_else(|_| UtxoSet::new());
+    let h = storage.max_height()?.unwrap_or(0);
+    let filter = aevum::prisma::filter::PrismaFilter::strict();
+    println!("Риск адреса {}:", hex::encode(&pk.to_bytes()[..8]));
+    let mut found = false;
+    for (_, u) in utxos.all() {
+        if u.owner().to_bytes() != pk.to_bytes() { continue; }
+        found = true;
+        let result = filter.check_utxo(u, h, None);
+        let status = if result.is_accepted() { "✅ Принимается" } else { "❌ Отклоняется" };
+        let cat = u.restriction_level() & aevum::core::jt_utxo::CATEGORY_MASK;
+        let cat_name = match cat {
+            aevum::core::jt_utxo::CAT_GLOBAL => "Глобальный",
+            aevum::core::jt_utxo::CAT_JURISDICTION => "Юрисдикционный",
+            aevum::core::jt_utxo::CAT_COMPUTE => "Compute",
+            aevum::core::jt_utxo::CAT_RISK_TAG => "⚠️  Риск",
+            _ => "Неизвестный",
+        };
+        let taint = aevum::core::jt_utxo::decay_taint(u.taint_distance, u.taint_timestamp, h);
+        println!("├─ Сумма: {:.8} AEV | Категория: {} | Taint: {} хопов | Статус: {}", 
+            u.amount() as f64 / 100_000_000.0, cat_name, taint, status);
+    }
+    if !found { println!("├─ Нет UTXO для этого адреса"); }
+    println!("└─ Высота: {}", h);
+    Ok(())
+}
+
+fn cmd_prove_innocence(args: &[String], db_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let addr = parse_hex_arg(args, "--address")?;
+    let pk = validate_public_key(&addr, "адрес")?;
+    let oracle_pk_hex = args.iter().position(|a| a == "--oracle-pubkey").and_then(|i| args.get(i + 1)).ok_or("--oracle-pubkey required")?;
+    let oracle_bytes = hex::decode(oracle_pk_hex).map_err(|_| "Invalid oracle pubkey")?;
+    let mut opk = [0u8; 32]; opk.copy_from_slice(&oracle_bytes[..32]);
+    let oracle_pk = PublicKey::from_bytes(opk).map_err(|_| "Invalid oracle key")?;
+    let storage = Storage::open(db_path)?;
+    let h = storage.max_height()?.unwrap_or(0);
+    let sanctions_root = aevum::crypto::hash::Hash([1u8; 32]);
+    let risk_root = aevum::crypto::hash::Hash([2u8; 32]);
+    let mut msg = Vec::new(); msg.extend_from_slice(sanctions_root.as_bytes()); msg.extend_from_slice(risk_root.as_bytes()); msg.extend_from_slice(&h.to_le_bytes());
+    let sig = vec![0u8; 64];
+    let proof = aevum::oracle::innocence::InnocenceProof::create(&pk, &sanctions_root, &risk_root, &oracle_pk, sig, h);
+    let json = proof.to_json()?;
+    let filename = format!("innocence_proof_{}.json", hex::encode(&pk.to_bytes()[..8]));
+    std::fs::write(&filename, &json)?;
+    println!("Доказательство создано: {}", filename);
+    Ok(())
+}
+
+fn cmd_verify_innocence(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let proof_file = args.iter().position(|a| a == "--proof").and_then(|i| args.get(i + 1)).ok_or("--proof required")?;
+    let json = std::fs::read_to_string(proof_file)?;
+    let proof = aevum::oracle::innocence::InnocenceProof::from_json(&json)?;
+    let current_h = args.iter().position(|a| a == "--height").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(1000);
+    let sanctions_root = aevum::crypto::hash::Hash([1u8; 32]);
+    let risk_root = aevum::crypto::hash::Hash([2u8; 32]);
+    match proof.verify(&sanctions_root, &risk_root, current_h) {
+        Ok(true) => println!("✅ Доказательство действительно"),
+        Ok(false) => println!("❌ Доказательство недействительно"),
+        Err(e) => println!("❌ Ошибка: {}", e),
+    }
+    Ok(())
+}
 fn cmd_prisma_config(args: &[String], db_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let addr = parse_hex_arg(args, "--address")?; let pk = validate_public_key(&addr, "адрес")?;
     let mut storage = Storage::open(db_path)?;
