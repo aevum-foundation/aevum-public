@@ -149,6 +149,12 @@ impl Storage {
         Ok(NonceStatus::Rejected { last_nonce: last_nonce as u64 })
     }
 
+    pub fn delete_block(&mut self, height: u64) -> Result<(), Box<dyn std::error::Error>> {
+        self.conn.execute("DELETE FROM blocks WHERE height = ?1", rusqlite::params![height])?;
+        self.conn.execute("DELETE FROM transactions WHERE block_height = ?1", rusqlite::params![height])?;
+        Ok(())
+    }
+
     pub fn save_metadata(&self, key: &str, value: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
         self.conn.execute(
             "INSERT OR REPLACE INTO metadata (key, value) VALUES (?1, ?2)",

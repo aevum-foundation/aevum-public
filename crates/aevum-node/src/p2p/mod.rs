@@ -52,8 +52,8 @@ impl P2pNode {
     }
 }
 pub mod connection;
-pub mod sync_engine;
 pub mod dht;
 pub mod peer_score;
 pub mod addr_manager;
 pub mod snapshots;
+pub use noise::AtpCipher as NoiseCipher;

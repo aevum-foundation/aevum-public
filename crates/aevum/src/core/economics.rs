@@ -7,7 +7,7 @@ pub struct Economics;
 
 impl Economics {
     pub const SATOSHI_PER_AEV: u64 = 100_000_000;
-    pub const INITIAL_REWARD_SATOSHI: u64 = 5_000_000_000; // 50 AEV
+    pub const INITIAL_REWARD_SATOSHI: u64 = 5_000_000_000;
     pub const HALVING_INTERVAL: u64 = 210_000;
     pub const MAX_SUPPLY_AEV: u64 = 21_000_000;
     pub const MAX_SUPPLY_SATOSHI: u64 = Self::MAX_SUPPLY_AEV * Self::SATOSHI_PER_AEV;
@@ -40,19 +40,23 @@ impl Economics {
         let miner_reward = base_reward.saturating_add(miner_fee_share);
 
         let mut outputs = Vec::new();
+        let amount_blind = blake3::hash(&height.to_le_bytes()).into();
+        let tag_blind = blake3::hash(&serial.to_le_bytes()).into();
         let miner_utxo = JtUtxo::new_global_clean(
-            miner.clone(), miner_reward, &[0u8; 32], &[0u8; 32], serial, height, Hash::zero(),
+            miner.clone(), miner_reward, &amount_blind, &tag_blind, serial, height, Hash::zero(),
         ).expect("coinbase UTXO creation failed");
         outputs.push(TxOutput::from_jt_utxo(&miner_utxo, 0));
 
         if developer_cut > 0 {
+            let amount_blind2 = blake3::hash(&(height + 1).to_le_bytes()).into();
+            let tag_blind2 = blake3::hash(&(serial + 1).to_le_bytes()).into();
             let dev_utxo = JtUtxo::new_global_clean(
-                developer_address.clone(), developer_cut, &[0u8; 32], &[0u8; 32], serial + 1, height, Hash::zero(),
+                developer_address.clone(), developer_cut, &amount_blind2, &tag_blind2, serial + 1, height, Hash::zero(),
             ).expect("dev UTXO creation failed");
             outputs.push(TxOutput::from_jt_utxo(&dev_utxo, 1));
         }
 
-        Transaction::new(vec![], outputs, poh_tick)
+        { let mut tx = Transaction::new(vec![], outputs, 0); tx.poh_tick = poh_tick; tx.compute_hash(); tx }
     }
 
     pub fn check_supply(current_supply: u64, additional: u64) -> bool {

@@ -16,7 +16,6 @@ use aevum_node::p2p::sync::{AtpMessage, SyncContext, create_status, handle_atp_m
 use aevum_node::p2p::gossip::GossipManager;
 use aevum_node::p2p::noise::{AtpCipher, TofuStore};
 use aevum_node::p2p::connection::AtpConnection;
-use aevum_node::p2p::sync_engine::SyncEngine;
 use aevum_node::p2p::peer_score::PeerScoring;
 use aevum_node::p2p::addr_manager::AddrManager;
 use aevum_node::p2p::snapshots::SnapshotManager;
@@ -102,6 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let utxo_set = storage.lock().unwrap().load_utxo_set().unwrap_or_else(|_| UtxoSet::new());
     if !utxo_set.is_empty() {
         validator.load_utxo_set(utxo_set);
+        validator.genesis_applied = true;
         if let Some(lb) = storage.lock().unwrap().load_block(max_height)? { validator.set_last_block(lb.block_hash, lb.height, lb.poh_tick_end); }
     } else if let Some(gb) = storage.lock().unwrap().load_block(0)? { let mut gb = gb; validator.validate_and_apply(&mut gb)?; }
 
@@ -148,6 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_peers: Vec<String> = if cli.bootstrap_peers.is_empty() { vec![] } else { cli.bootstrap_peers.split(',').map(|s| s.trim().to_string()).collect() };
 
     std::thread::spawn(move || {
+            tracing::info!("⛏️  Mining thread started");
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4).thread_name("aevum-atp").enable_all().build().unwrap();
         rt.block_on(async move {
@@ -206,6 +207,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mempool_http = mempool.clone(); let validator_http = validator.clone(); let peers_http = peers.clone();
     let shutdown_http = shutdown.clone(); let start_time_http = start_time;
     std::thread::spawn(move || {
+            tracing::info!("⛏️  Mining thread started");
         let addr = format!("0.0.0.0:{}", http_port);
         let server = match tiny_http::Server::http(&addr) { Ok(s) => s, Err(e) => { tracing::error!("HTTP: {}", e); return; } };
         tracing::info!("HTTP API on http://{}", addr);
@@ -241,12 +243,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let vm = validator.clone(); let mm = mempool.clone(); let sm = storage.clone();
         let dam = developer_address; let sc = serial_counter.clone(); let shm = shutdown.clone(); let pm = peers.clone(); let s_m = sync_ctx.clone();
         let handle = std::thread::spawn(move || {
+            tracing::info!("⛏️  Mining thread started");
             while !shm.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_secs(1));
                 let (tick_result, txs_backup, height, poh) = {
                     let mut val = vm.lock().unwrap(); let mut mem = mm.lock().unwrap();
                     val.tick_poh(); let poh = val.poh().current_tick_number();
-                    if poh % 10 == 0 || !mem.is_empty() { (true, mem.take_batch(100), val.last_block_height() + 1, poh) }
+                    if poh % 30 == 0 || !mem.is_empty() { (true, mem.take_batch(100), val.last_block_height() + 1, poh) }
                     else { (false, vec![], 0, poh) }
                 };
                 if tick_result {
@@ -259,7 +262,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut serial = sc.lock().unwrap(); *serial += 2;
                     let coinbase = Economics::create_coinbase(&mk.public_key(), height, total_fees, &dam, *serial, poh);
                     txs.insert(0, coinbase);
-                    let mut block = Block::new(val.last_block_hash(), height, poh, poh + TICKS_PER_BLOCK, txs, val.utxo_set().get_state_root(), val.utxo_set().total_supply() + total_fees, None);
+                    let mut block = Block::new(val.last_block_hash(), height, poh, poh + TICKS_PER_BLOCK, txs, val.utxo_set().get_state_root(), val.utxo_set().total_supply() + Economics::block_reward_satoshi(height) + total_fees, None);
                     if val.validate_and_apply(&mut block).is_ok() {
                         st.save_block(&block).ok(); if let Err(e) = st.save_utxo_set(val.utxo_set()) { tracing::error!("Failed to save UTXO: {}", e); }
                         let _ = bincode::serialize(&val.poh_snapshot()).ok().and_then(|s| st.save_metadata(POH_SNAPSHOT_KEY, &s).ok());
@@ -282,6 +285,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Heartbeat
     let hb_ctx = sync_ctx.clone(); let hb_peers = peers.clone(); let shutdown_hb = shutdown.clone();
     std::thread::spawn(move || {
+            tracing::info!("⛏️  Mining thread started");
         while !shutdown_hb.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_secs(30));
             let h = hb_ctx.validator.lock().unwrap().last_block_height();
