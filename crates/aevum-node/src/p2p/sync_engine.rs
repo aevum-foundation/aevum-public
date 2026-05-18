@@ -98,7 +98,7 @@ impl SyncEngine {
             return;
         }
 
-        tracing::info!("[Sync] {} headers validated, requesting blocks", headers.len());
+        tracing::info!("[Sync] {} headers validated, requesting blocks", self.headers.len());
         self.request_blocks();
     }
 
