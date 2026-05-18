@@ -56,3 +56,4 @@ pub mod sync_engine;
 pub mod dht;
 pub mod peer_score;
 pub mod addr_manager;
+pub mod snapshots;

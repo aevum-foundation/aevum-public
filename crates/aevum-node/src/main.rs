@@ -19,6 +19,7 @@ use aevum_node::p2p::connection::AtpConnection;
 use aevum_node::p2p::sync_engine::SyncEngine;
 use aevum_node::p2p::peer_score::PeerScoring;
 use aevum_node::p2p::addr_manager::AddrManager;
+use aevum_node::p2p::snapshots::SnapshotManager;
 use clap::Parser;
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -35,7 +36,7 @@ const SERIAL_COUNTER_KEY: &str = "serial_counter";
 const TICKS_PER_BLOCK: u64 = 100;
 
 #[derive(Parser)]
-#[command(name = "aevum-node", version = "0.2.0")]
+#[command(name = "aevum-node", version = "0.3.0")]
 struct Cli {
     #[arg(long, default_value = "0.0.0.0:9733")] listen_addr: String,
     #[arg(long, default_value = "")] bootstrap_peers: String,
@@ -135,7 +136,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown_ctrl.store(true, Ordering::SeqCst);
     }).expect("Error setting Ctrl-C handler");
 
+    // ============================================================
     // ATP ПОТОК
+    // ============================================================
     let server_listen_addr = cli.listen_addr.clone();
     let atp_peers = peers.clone();
     let atp_ctx = sync_ctx.clone();
@@ -230,7 +233,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Майнинг
+    // ============================================================
+    // МАЙНИНГ
+    // ============================================================
     let mut mining_handle = None;
     if let Some(mk) = miner_key {
         let vm = validator.clone(); let mm = mempool.clone(); let sm = storage.clone();
@@ -256,9 +261,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     txs.insert(0, coinbase);
                     let mut block = Block::new(val.last_block_hash(), height, poh, poh + TICKS_PER_BLOCK, txs, val.utxo_set().state_root(), val.utxo_set().total_supply() + total_fees, None);
                     if val.validate_and_apply(&mut block).is_ok() {
-                        st.save_block(&block).ok(); st.save_utxo_set(val.utxo_set()).ok();
+                        st.save_block(&block).ok(); if let Err(e) = st.save_utxo_set(val.utxo_set()) { tracing::error!("Failed to save UTXO: {}", e); }
                         let _ = bincode::serialize(&val.poh_snapshot()).ok().and_then(|s| st.save_metadata(POH_SNAPSHOT_KEY, &s).ok());
                         let _ = bincode::serialize(&*serial).ok().and_then(|s| st.save_metadata(SERIAL_COUNTER_KEY, &s).ok());
+                        // UTXO снапшот каждые 1000 блоков
+                        if height % 1000 == 0 {
+                            let _ = SnapshotManager::save_if_needed(&sm, height, val.utxo_set());
+                        }
                         drop(val); drop(st); drop(serial);
                         tracing::info!("⛏️  Mined block at height {}", height);
                         let status = create_status(&s_m);

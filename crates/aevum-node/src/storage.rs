@@ -18,6 +18,11 @@ impl Storage {
     pub fn open(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let conn = Connection::open(path)?;
         conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=FULL;
+             PRAGMA wal_autocheckpoint=1000;"
+        )?;
+        conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS blocks (
                 height INTEGER PRIMARY KEY,
                 block_hash BLOB NOT NULL,
@@ -37,6 +42,10 @@ impl Storage {
             CREATE TABLE IF NOT EXISTS utxos (
                 nullifier BLOB PRIMARY KEY,
                 data BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS nonces (
+                key TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY,
@@ -66,6 +75,9 @@ impl Storage {
     }
 
     pub fn save_utxo_set(&mut self, utxo_set: &UtxoSet) -> Result<(), Box<dyn std::error::Error>> {
+        if utxo_set.is_empty() {
+            return Err("Refusing to save empty UTXO set".into());
+        }
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM utxos", [])?;
         for (nullifier, utxo) in utxo_set.all() {
@@ -82,47 +94,59 @@ impl Storage {
         let mut utxo_set = UtxoSet::new();
         let mut stmt = self.conn.prepare("SELECT data FROM utxos")?;
         let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut count = 0usize;
         for row in rows {
             let utxo: JtUtxo = bincode::deserialize(&row?)?;
             utxo_set.add(utxo);
+            count += 1;
+        }
+        if count == 0 {
+            if let Some(height) = self.max_height()? {
+                if height > 0 {
+                    tracing::warn!("UTXO set empty but blocks exist up to height {}", height);
+                }
+            }
         }
         Ok(utxo_set)
     }
 
-    /// Атомарно проверяет и обновляет nonce (требует &mut self как save_block)
+    pub fn rebuild_utxo_set(&self, genesis_seed: &[u8]) -> Result<UtxoSet, Box<dyn std::error::Error>> {
+        use aevum::consensus::validator::Validator;
+        let mut validator = Validator::new(genesis_seed);
+        if let Some(max_h) = self.max_height()? {
+            for h in 0..=max_h {
+                if let Some(block) = self.load_block(h)? {
+                    let mut b = block;
+                    validator.validate_and_apply(&mut b)
+                        .map_err(|e| format!("Rebuild failed at height {}: {:?}", h, e))?;
+                }
+            }
+            tracing::info!("UTXO rebuilt from {} blocks", max_h + 1);
+        }
+        Ok(validator.utxo_set().clone())
+    }
+
     pub fn check_and_update_nonce(&mut self, key: &str, new_nonce: u64) -> Result<NonceStatus, Box<dyn std::error::Error>> {
         let tx = self.conn.transaction()?;
-
-        let updated = tx.execute(
-            "UPDATE metadata SET value = ?1 WHERE key = ?2 AND CAST(value AS INTEGER) < ?3",
-            params![bincode::serialize(&new_nonce)?, key, new_nonce as i64],
+        tx.execute(
+            "INSERT OR IGNORE INTO nonces (key, value) VALUES (?1, 0)",
+            params![key],
         )?;
-
+        let updated = tx.execute(
+            "UPDATE nonces SET value = ?1 WHERE key = ?2 AND value < ?1",
+            params![new_nonce as i64, key],
+        )?;
         if updated > 0 {
             tx.commit()?;
             return Ok(NonceStatus::Accepted);
         }
-
-        let existing: Option<Vec<u8>> = tx.query_row(
-            "SELECT value FROM metadata WHERE key = ?1",
+        let last_nonce: i64 = tx.query_row(
+            "SELECT value FROM nonces WHERE key = ?1",
             params![key],
             |row| row.get(0),
-        ).optional()?;
-
-        match existing {
-            None => {
-                tx.execute(
-                    "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
-                    params![key, bincode::serialize(&new_nonce)?],
-                )?;
-                tx.commit()?;
-                Ok(NonceStatus::Accepted)
-            }
-            Some(bytes) => {
-                let last_nonce: u64 = bincode::deserialize(&bytes).unwrap_or(0);
-                Ok(NonceStatus::Rejected { last_nonce })
-            }
-        }
+        )?;
+        tx.commit()?;
+        Ok(NonceStatus::Rejected { last_nonce: last_nonce as u64 })
     }
 
     pub fn save_metadata(&self, key: &str, value: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
@@ -139,6 +163,12 @@ impl Storage {
         Ok(value)
     }
 
+    pub fn delete_metadata(&self, key: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let mut stmt = self.conn.prepare("DELETE FROM metadata WHERE key = ?1")?;
+        stmt.execute(params![key])?;
+        Ok(())
+    }
+
     pub fn load_block(&self, height: u64) -> Result<Option<Block>, Box<dyn std::error::Error>> {
         let mut stmt = self.conn.prepare("SELECT data FROM blocks WHERE height = ?1")?;
         let result: Option<Vec<u8>> = stmt.query_row(params![height], |row| row.get(0)).optional()?;
@@ -150,7 +180,25 @@ impl Storage {
 
     pub fn max_height(&self) -> Result<Option<u64>, Box<dyn std::error::Error>> {
         let mut stmt = self.conn.prepare("SELECT COALESCE(MAX(height), 0) FROM blocks")?;
-        let result: u64 = stmt.query_row([], |row| row.get(0))?;
-        if result == 0 { Ok(None) } else { Ok(Some(result)) }
+        let result: i64 = stmt.query_row([], |row| row.get(0))?;
+        if result == 0 { Ok(None) } else { Ok(Some(result as u64)) }
+    }
+
+    pub fn integrity_check(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        let mut stmt = self.conn.prepare("PRAGMA integrity_check")?;
+        let result: String = stmt.query_row([], |row| row.get(0))?;
+        Ok(result == "ok")
+    }
+
+    pub fn optimize(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.conn.execute_batch("PRAGMA optimize;")?;
+        tracing::info!("Storage optimized");
+        Ok(())
+    }
+
+    pub fn checkpoint(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        tracing::info!("WAL checkpoint completed");
+        Ok(())
     }
 }

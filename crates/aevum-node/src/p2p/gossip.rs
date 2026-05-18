@@ -41,8 +41,8 @@ impl GossipManager {
             
             if let Ok(data) = bincode::serialize(&msg) {
                 let mut peer_ids: Vec<[u8; 20]> = Vec::new();
-                for entry in &peers.peers {
-                    peer_ids.push(*entry.key());
+                for entry in peers.peers.iter() {
+                    peer_ids.push(entry.key().clone());
                 }
                 
                 let fanout = FANOUT.min(peer_ids.len());

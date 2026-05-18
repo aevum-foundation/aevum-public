@@ -4,6 +4,7 @@ use crate::crypto::hash::Hash;
 use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct UtxoSet {
     utxos: HashMap<Hash, JtUtxo>,
     state_root: Hash,
@@ -53,7 +54,6 @@ impl UtxoSet {
     pub fn apply_block(&mut self, block: &Block) -> Result<Hash, &'static str> {
         let mut spent_in_block: Vec<&Hash> = Vec::new();
         for tx in &block.transactions {
-            // TX processing logged
             for input in &tx.inputs {
                 if spent_in_block.contains(&&input.nullifier) {
                     return Err("Double-spend within block");
@@ -65,9 +65,8 @@ impl UtxoSet {
             }
         }
         for tx in &block.transactions {
-            // TX processing logged
             for output in &tx.outputs {
-                let utxo = JtUtxo::from_tx_output(output, tx.tx_hash);
+                let utxo = JtUtxo::from_tx_output(output, tx.tx_hash, block.height);
                 self.add(utxo);
             }
         }
@@ -95,20 +94,16 @@ impl UtxoSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::jt_utxo::ZkProof;
     use crate::core::transaction::{Transaction, TxInput, TxOutput};
     use crate::crypto::keys::PublicKey;
 
     fn dummy_utxo(serial: u64) -> JtUtxo {
         let owner = PublicKey::dummy();
         JtUtxo::new_global_clean(
-            owner.clone(),
-            100,
-            &[0u8; 32],
-            &[1u8; 32],
-            serial,
+            owner.clone(), 100,
+            &[1u8; 32], &[1u8; 32], serial, 1,
             Hash::zero(),
-        )
+        ).expect("dummy UTXO")
     }
 
     #[test]
