@@ -185,6 +185,7 @@ impl AtpConnection {
         }
 
         tracing::info!("[ATP] Handshake done, entering active loop");
+        // Запрашиваем список пиров у соседа (PEX)
 
         // ACTIVE LOOP
         loop {

@@ -16,6 +16,7 @@ use aevum_node::p2p::sync::{AtpMessage, SyncContext, create_status, handle_atp_m
 use aevum_node::p2p::gossip::GossipManager;
 use aevum_node::p2p::noise::{AtpCipher, TofuStore};
 use aevum_node::p2p::connection::AtpConnection;
+use aevum_node::p2p::pex::PeerExchange;
 use aevum_node::p2p::peer_score::PeerScoring;
 use aevum_node::p2p::addr_manager::AddrManager;
 use aevum_node::p2p::snapshots::SnapshotManager;
@@ -186,6 +187,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         tokio::time::sleep(Duration::from_millis(200)).await;
                                         // Теперь отправляем BlobRequest
                                         tracing::info!("[ATP] Sending BlobRequest for {}", hex::encode(&dk.public_key().to_bytes()));
+                                        // PEX: запрашиваем список пиров
+                                        aevum_node::p2p::pex::PeerExchange::request_peers(&dp, &peer_id);
                                         if let Some(ref rep) = dc.replication {
                                             let req = AtpMessage::BlobRequest { blob_hashes: vec![dk.public_key().to_bytes()] };
                                             if let Ok(data) = bincode::serialize(&req) { dp.send_to(&peer_id, data); }

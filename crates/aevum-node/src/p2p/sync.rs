@@ -21,6 +21,8 @@ pub enum AtpMessage {
     BlobResponse { blobs: Vec<crate::encrypted_replication::EncryptedBlob> },
     Ping { nonce: u64 },
     ReadySignal,
+    GetPeers { count: u8 },
+    PeerList { addrs: Vec<([u8; 16], u16)> },
     Pong { nonce: u64 },
 }
 
@@ -95,6 +97,14 @@ pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8
             }
             drop(buffer);
             flush_block_buffer(ctx);
+        }
+        AtpMessage::GetPeers { count } => {
+            let msg = crate::p2p::pex::PeerExchange::create_peer_list(peers, count as usize);
+            if let Ok(data) = bincode::serialize(&msg) { peers.send_to(peer_id, data); }
+        }
+        AtpMessage::PeerList { addrs } => {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            crate::p2p::pex::PeerExchange::process_peer_list(&addrs, peers, now);
         }
         AtpMessage::ReadySignal => { tracing::info!("[SYNC] ReadySignal received from {}", hex::encode(peer_id)); }
         AtpMessage::Ping { nonce } => {

@@ -57,3 +57,4 @@ pub mod peer_score;
 pub mod addr_manager;
 pub mod snapshots;
 pub use noise::AtpCipher as NoiseCipher;
+pub mod pex;
