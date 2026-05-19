@@ -52,6 +52,13 @@ impl PeersManager {
         }
     }
     pub fn peer_count(&self) -> usize { self.peers.len() }
+    pub fn random_peers(&self, count: usize) -> Vec<[u8; 20]> {
+        use rand::seq::SliceRandom;
+        let mut peers: Vec<[u8; 20]> = self.peers.iter().map(|e| *e.key()).collect();
+        peers.shuffle(&mut rand::thread_rng());
+        peers.truncate(count.min(peers.len()));
+        peers
+    }
     pub fn send_to(&self, peer_id: &[u8; 20], msg: Vec<u8>) -> bool {
         if let Some(mut s) = self.peers.get_mut(peer_id) {
             if s.last_reset.elapsed() >= Duration::from_secs(1) { s.msg_count = 0; s.last_reset = Instant::now(); }

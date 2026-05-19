@@ -17,7 +17,10 @@ pub enum AtpMessage {
     BlockRequest { request_id: u64, from: u64, to: u64 },
     BlockResponse { request_id: u64, blocks: Vec<(u64, Vec<u8>)> },
     Transaction { tx_hash: [u8; 32], ttl: u8, bytes: Vec<u8> },
+    BlobRequest { blob_hashes: Vec<[u8; 32]> },
+    BlobResponse { blobs: Vec<crate::encrypted_replication::EncryptedBlob> },
     Ping { nonce: u64 },
+    ReadySignal,
     Pong { nonce: u64 },
 }
 
@@ -34,11 +37,12 @@ pub struct SyncContext {
     pub storage: Arc<StdMutex<Storage>>,
     pub chain_sync: Arc<StdMutex<ChainSync>>,
     pub block_buffer: Arc<StdMutex<BTreeMap<u64, Vec<u8>>>>,
+    pub replication: Option<Arc<StdMutex<crate::encrypted_replication::EncryptedReplication>>>,
 }
 
 pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8; 20], peers: &Arc<PeersManager>) {
     match msg {
-        AtpMessage::Status { height, state_root, .. } => {
+        AtpMessage::Status { height, state_root, .. } => { tracing::info!("[SYNC] Status");
             let my = ctx.validator.lock().unwrap().last_block_height();
             tracing::info!("📊 Peer {} height: {}, my: {}, state_root: {}", hex::encode(peer_id), height, my, hex::encode(&state_root));
             if height > my {
@@ -53,28 +57,17 @@ pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8
             let mut headers = Vec::new();
             for h in from..=to {
                 if let Ok(Some(b)) = st.load_block(h) {
-                    headers.push(BlockHeader {
-                        height: b.height,
-                        block_hash: b.block_hash.0,
-                        prev_hash: b.prev_hash.0,
-                        state_root: b.state_root.0,
-                    });
+                    headers.push(BlockHeader { height: b.height, block_hash: b.block_hash.0, prev_hash: b.prev_hash.0, state_root: b.state_root.0 });
                 }
             }
             drop(st);
-            if let Ok(data) = bincode::serialize(&AtpMessage::HeaderResponse { headers }) {
-                peers.send_to(peer_id, data);
-            }
+            if let Ok(data) = bincode::serialize(&AtpMessage::HeaderResponse { headers }) { peers.send_to(peer_id, data); }
         }
         AtpMessage::HeaderResponse { headers } => {
             if let Some(last) = headers.last() {
                 let my = ctx.validator.lock().unwrap().last_block_height();
                 if last.height > my {
-                    let req = AtpMessage::BlockRequest {
-                        request_id: rand::random(),
-                        from: my + 1,
-                        to: (my + MAX_BLOCKS_PER_REQUEST).min(last.height),
-                    };
+                    let req = AtpMessage::BlockRequest { request_id: rand::random(), from: my + 1, to: (my + MAX_BLOCKS_PER_REQUEST).min(last.height) };
                     if let Ok(data) = bincode::serialize(&req) { peers.send_to(peer_id, data); }
                 }
             }
@@ -89,11 +82,9 @@ pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8
                 }
             }
             drop(st);
-            if let Ok(data) = bincode::serialize(&AtpMessage::BlockResponse { request_id, blocks }) {
-                peers.send_to(peer_id, data);
-            }
+            if let Ok(data) = bincode::serialize(&AtpMessage::BlockResponse { request_id, blocks }) { peers.send_to(peer_id, data); }
         }
-        AtpMessage::BlockResponse { blocks, .. } => {
+        AtpMessage::BlockResponse { blocks, .. } => { tracing::info!("[SYNC] BlockResponse({})", blocks.len());
             let mut buffer = ctx.block_buffer.lock().unwrap();
             for (height, block_bytes) in blocks {
                 if buffer.len() >= MAX_BUFFERED_BLOCKS {
@@ -104,8 +95,23 @@ pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8
             drop(buffer);
             flush_block_buffer(ctx);
         }
+        AtpMessage::ReadySignal => { tracing::info!("[SYNC] ReadySignal received from {}", hex::encode(peer_id)); }
         AtpMessage::Ping { nonce } => {
             if let Ok(data) = bincode::serialize(&AtpMessage::Pong { nonce }) { peers.send_to(peer_id, data); }
+        }
+        AtpMessage::BlobRequest { blob_hashes } => { tracing::info!("[SYNC] BlobRequest({})", blob_hashes.len());
+            if let Some(rep) = ctx.replication.as_ref() {
+                let rep = rep.lock().unwrap();
+                let blobs = rep.query_blobs_by_hash(&blob_hashes);
+                let resp = AtpMessage::BlobResponse { blobs };
+                if let Ok(data) = bincode::serialize(&resp) { peers.send_to(peer_id, data); }
+            }
+        }
+        AtpMessage::BlobResponse { blobs } => { tracing::info!("[SYNC] BlobResponse({})", blobs.len());
+            if let Some(rep) = ctx.replication.as_ref() {
+                let mut rep = rep.lock().unwrap();
+                for blob in blobs { rep.store_received(blob); }
+            }
         }
         _ => {}
     }
@@ -142,14 +148,11 @@ pub fn flush_block_buffer(ctx: &SyncContext) {
                 Err(e) => {
                     let err_msg = format!("{:?}", e);
                     tracing::warn!("Block {} failed: {}", next, err_msg);
-                    // FORK RESOLUTION: если prev_hash mismatch — переключиться на цепочку пира
                     if err_msg.contains("prev_hash") {
                         tracing::warn!("🔄 Fork at height {}: rewinding for peer chain", next);
                         if let Some(my_block) = st.load_block(next).ok().flatten() {
-                            // Возвращаем UTXO которые были в нашем блоке
                             for tx in &my_block.transactions {
                                 for input in &tx.inputs {
-                                    // Упрощённо: добавляем UTXO обратно
                                     if let Ok(Some(utxo_data)) = st.load_metadata(&format!("utxo_backup_{}", hex::encode(input.nullifier.as_bytes()))) {
                                         if let Ok(utxo) = bincode::deserialize(&utxo_data) {
                                             val.utxo_set_mut().add(utxo);
@@ -159,7 +162,6 @@ pub fn flush_block_buffer(ctx: &SyncContext) {
                             }
                         }
                         st.delete_block(next).ok();
-                        // Пробуем блок пира
                         if val.validate_and_apply(&mut b).is_ok() {
                             st.save_block(&b).ok();
                             st.save_utxo_set(val.utxo_set()).ok();

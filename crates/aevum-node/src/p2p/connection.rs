@@ -27,6 +27,14 @@ pub struct AtpConnection {
     recv_cipher: Arc<StdMutex<AtpCipher>>,
     peers: Arc<PeersManager>,
     ctx: Arc<SyncContext>,
+    /// Буфер исходящих до полной готовности
+    pending_outgoing: Vec<Vec<u8>>,
+    /// Пир прислал ReadySignal?
+    peer_ready: bool,
+    /// Мы отправили ReadySignal?
+    we_sent_ready: bool,
+    /// Канал отправки (заполняется в run)
+    outgoing_tx: Option<mpsc::Sender<Vec<u8>>>,
 }
 
 impl AtpConnection {
@@ -42,12 +50,55 @@ impl AtpConnection {
             state: ConnState::Handshaking,
             stats: PeerStats { connected_at: Some(Instant::now()), ..Default::default() },
             send_cipher, recv_cipher,
+            pending_outgoing: Vec::new(),
+            peer_ready: false,
+            we_sent_ready: false,
+            outgoing_tx: None,
+        }
+    }
+
+    /// Отправить или буферизовать (Thread-safe через outgoing_tx)
+    pub fn send_or_buffer(&mut self, data: Vec<u8>) {
+        if self.peer_ready && self.we_sent_ready {
+            if let Some(ref tx) = self.outgoing_tx {
+                let _ = tx.try_send(data);
+                return;
+            }
+        }
+        self.pending_outgoing.push(data);
+    }
+
+    /// Пир прислал ReadySignal — разблокируем буфер
+    pub fn on_peer_ready(&mut self) {
+        self.peer_ready = true;
+        self.flush_buffer();
+    }
+
+    /// Отправляем ReadySignal пиру
+    pub fn send_ready_signal(&mut self) {
+        self.we_sent_ready = true;
+        if let Some(ref tx) = self.outgoing_tx {
+            if let Ok(data) = bincode::serialize(&AtpMessage::ReadySignal) {
+                let _ = tx.try_send(data);
+            }
+        }
+        self.flush_buffer();
+    }
+
+    fn flush_buffer(&mut self) {
+        if self.peer_ready && self.we_sent_ready {
+            if let Some(ref tx) = self.outgoing_tx {
+                for data in self.pending_outgoing.drain(..) {
+                    let _ = tx.try_send(data);
+                }
+            }
         }
     }
 
     pub async fn run(mut self, mut reader: ReadHalf<TcpStream>, mut writer: WriteHalf<TcpStream>) {
         tracing::info!("[ATP] run() START — is_server={}", self.is_server);
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
+        self.outgoing_tx = Some(tx.clone());
         self.peers.register_peer(self.peer_id, self.addr, tx);
 
         let send_cipher = self.send_cipher.clone();
@@ -62,51 +113,74 @@ impl AtpConnection {
             tracing::info!("[ATP] SERVER: waiting for client status...");
             match Self::read_msg(&mut reader).await {
                 Ok(encrypted) => {
-                    tracing::info!("[ATP] SERVER: read_msg OK ({} bytes)", encrypted.len());
                     match recv_cipher.lock().unwrap().decrypt(&encrypted) {
                         Some(p) => {
-                            tracing::info!("[ATP] SERVER: decrypt OK ({} bytes)", p.len());
-                            match bincode::deserialize::<AtpMessage>(&p) {
-                                Ok(msg) => {
-                                    tracing::info!("[ATP] SERVER: deserialize OK");
-                                    tracing::info!("📊 Peer status received from {}", hex::encode(&peer_id));
-                                    let ctx_h = ctx.clone(); let peers_h = peers.clone(); let pid = peer_id;
-                                    tokio::spawn(async move { handle_atp_message(msg, &ctx_h, &pid, &peers_h); });
-                                }
-                                Err(e) => tracing::warn!("[ATP] SERVER: deserialize FAILED: {}", e),
+                            if let Ok(msg) = bincode::deserialize::<AtpMessage>(&p) {
+                                let ctx_h = ctx.clone(); let peers_h = peers.clone(); let pid = peer_id;
+                                tokio::spawn(async move { handle_atp_message(msg, &ctx_h, &pid, &peers_h); });
                             }
                         }
-                        None => tracing::warn!("[ATP] SERVER: decrypt FAILED (returned None)"),
+                        None => tracing::warn!("[ATP] SERVER: decrypt FAILED"),
                     }
                 }
                 Err(e) => tracing::warn!("[ATP] SERVER: read_msg FAILED: {}", e),
             }
-            tracing::info!("[ATP] SERVER: sending status...");
+            tracing::info!("[ATP] SERVER: sending status + ReadySignal");
             Self::send_status(&send_cipher, &ctx, &mut writer, &peer_id).await;
+            // Отправляем ReadySignal после статуса
+            // Отправляем ReadySignal напрямую в writer
+            let ready_data = bincode::serialize(&AtpMessage::ReadySignal).unwrap_or_default();
+            let encrypted = send_cipher.lock().unwrap().encrypt(&ready_data);
+            let len = (encrypted.len() as u32).to_be_bytes();
+            let mut packet = Vec::with_capacity(4 + encrypted.len());
+            packet.extend_from_slice(&len); packet.extend_from_slice(&encrypted);
+            let _ = writer.write_all(&packet).await;
+            let _ = writer.flush().await;
+            tracing::info!("[ATP] ReadySignal sent directly");
+            self.we_sent_ready = true;
         } else {
-            tracing::info!("[ATP] CLIENT: sending status...");
+            tracing::info!("[ATP] CLIENT: sending status + ReadySignal");
             Self::send_status(&send_cipher, &ctx, &mut writer, &peer_id).await;
+            // Отправляем ReadySignal напрямую в writer
+            let ready_data = bincode::serialize(&AtpMessage::ReadySignal).unwrap_or_default();
+            let encrypted = send_cipher.lock().unwrap().encrypt(&ready_data);
+            let len = (encrypted.len() as u32).to_be_bytes();
+            let mut packet = Vec::with_capacity(4 + encrypted.len());
+            packet.extend_from_slice(&len); packet.extend_from_slice(&encrypted);
+            let _ = writer.write_all(&packet).await;
+            let _ = writer.flush().await;
+            tracing::info!("[ATP] ReadySignal sent directly");
+            self.we_sent_ready = true;
             tracing::info!("[ATP] CLIENT: waiting for server status...");
             match Self::read_msg(&mut reader).await {
                 Ok(encrypted) => {
-                    tracing::info!("[ATP] CLIENT: read_msg OK ({} bytes)", encrypted.len());
                     match recv_cipher.lock().unwrap().decrypt(&encrypted) {
                         Some(p) => {
-                            tracing::info!("[ATP] CLIENT: decrypt OK ({} bytes)", p.len());
-                            match bincode::deserialize::<AtpMessage>(&p) {
-                                Ok(msg) => {
-                                    tracing::info!("[ATP] CLIENT: deserialize OK");
-                                    tracing::info!("📊 Peer status received from {}", hex::encode(&peer_id));
-                                    let ctx_h = ctx.clone(); let peers_h = peers.clone(); let pid = peer_id;
-                                    tokio::spawn(async move { handle_atp_message(msg, &ctx_h, &pid, &peers_h); });
-                                }
-                                Err(e) => tracing::warn!("[ATP] CLIENT: deserialize FAILED: {}", e),
+                            if let Ok(msg) = bincode::deserialize::<AtpMessage>(&p) {
+                                let ctx_h = ctx.clone(); let peers_h = peers.clone(); let pid = peer_id;
+                                tokio::spawn(async move { handle_atp_message(msg, &ctx_h, &pid, &peers_h); });
                             }
                         }
-                        None => tracing::warn!("[ATP] CLIENT: decrypt FAILED (returned None)"),
+                        None => tracing::warn!("[ATP] CLIENT: decrypt FAILED"),
                     }
                 }
                 Err(e) => tracing::warn!("[ATP] CLIENT: read_msg FAILED: {}", e),
+            }
+        }
+
+        // Ждём ReadySignal от пира (если ещё не получили)
+        if !self.peer_ready {
+            tracing::info!("[ATP] Waiting for peer ReadySignal...");
+            match Self::read_msg(&mut reader).await {
+                Ok(encrypted) => {
+                    if let Some(p) = recv_cipher.lock().unwrap().decrypt(&encrypted) {
+                        if let Ok(AtpMessage::ReadySignal) = bincode::deserialize(&p) {
+                            tracing::info!("[ATP] Peer ReadySignal received");
+                            self.on_peer_ready();
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("[ATP] ReadySignal wait failed: {}", e),
             }
         }
 
@@ -134,7 +208,12 @@ impl AtpConnection {
                             match recv_cipher.lock().unwrap().decrypt(&encrypted) {
                                 Some(plaintext) => {
                                     if let Ok(msg) = bincode::deserialize::<AtpMessage>(&plaintext) {
-                                        handle_atp_message(msg, &ctx, &peer_id, &peers);
+                                        if matches!(msg, AtpMessage::ReadySignal) {
+                                            tracing::info!("[ATP] ReadySignal in active loop");
+                                            self.on_peer_ready();
+                                        } else {
+                                            handle_atp_message(msg, &ctx, &peer_id, &peers);
+                                        }
                                     }
                                 }
                                 None => tracing::warn!("[ATP] active decrypt failed"),
@@ -165,12 +244,8 @@ impl AtpConnection {
         let len = (encrypted.len() as u32).to_be_bytes();
         let mut packet = Vec::with_capacity(4 + encrypted.len());
         packet.extend_from_slice(&len); packet.extend_from_slice(&encrypted);
-        if writer.write_all(&packet).await.is_err() {
-            tracing::warn!("write_all failed for {}", hex::encode(peer_id)); return false;
-        }
-        if writer.flush().await.is_err() {
-            tracing::warn!("flush failed for {}", hex::encode(peer_id)); return false;
-        }
+        if writer.write_all(&packet).await.is_err() { return false; }
+        if writer.flush().await.is_err() { return false; }
         tracing::info!("📤 Status sent to {}", hex::encode(peer_id));
         true
     }
@@ -179,7 +254,6 @@ impl AtpConnection {
         let mut len_buf = [0u8; 4];
         reader.read_exact(&mut len_buf).await?;
         let len = u32::from_be_bytes(len_buf) as usize;
-        tracing::info!("[ATP] read_msg: len={}", len);
         if len > 10 * 1024 * 1024 { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "too large")); }
         let mut encrypted = vec![0u8; len];
         reader.read_exact(&mut encrypted).await?;

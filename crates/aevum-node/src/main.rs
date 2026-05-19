@@ -19,6 +19,7 @@ use aevum_node::p2p::connection::AtpConnection;
 use aevum_node::p2p::peer_score::PeerScoring;
 use aevum_node::p2p::addr_manager::AddrManager;
 use aevum_node::p2p::snapshots::SnapshotManager;
+use aevum_node::encrypted_replication::EncryptedReplication;
 use clap::Parser;
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -122,11 +123,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let peer_scoring = Arc::new(StdMutex::new(PeerScoring::new()));
     let addr_manager = Arc::new(StdMutex::new(AddrManager::new(10000)));
 
+    let replication = Arc::new(StdMutex::new(EncryptedReplication::new(miner_key.clone(), 1000)));
     let sync_ctx = Arc::new(SyncContext {
         validator: validator.clone(),
         storage: storage.clone(),
         chain_sync: chain_sync.clone(),
         block_buffer: block_buffer.clone(),
+        replication: Some(replication.clone()),
     });
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -136,9 +139,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown_ctrl.store(true, Ordering::SeqCst);
     }).expect("Error setting Ctrl-C handler");
 
-    // ============================================================
     // ATP ПОТОК
-    // ============================================================
     let server_listen_addr = cli.listen_addr.clone();
     let atp_peers = peers.clone();
     let atp_ctx = sync_ctx.clone();
@@ -148,7 +149,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_peers: Vec<String> = if cli.bootstrap_peers.is_empty() { vec![] } else { cli.bootstrap_peers.split(',').map(|s| s.trim().to_string()).collect() };
 
     std::thread::spawn(move || {
-            tracing::info!("⛏️  Mining thread started");
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4).thread_name("aevum-atp").enable_all().build().unwrap();
         rt.block_on(async move {
@@ -168,8 +168,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if retry > 0 { tokio::time::sleep(Duration::from_secs(5 * (retry + 1) as u64)).await; }
                                 match aevum_node::p2p::peers::dial_peer(addr, dk.clone(), &dt).await {
                                     Ok((cipher, peer_id, reader, writer)) => {
-                                        tracing::info!("✅ CONNECTED to {}", hex::encode(&peer_id));
-                                        AtpConnection::new(cipher, peer_id, addr, dp.clone(), dc.clone(), false).run(reader, writer).await;
+                                        tracing::info!("[ATP] ✅ CONNECTED to {}", hex::encode(&peer_id));
+                                        let mut conn = AtpConnection::new(cipher, peer_id, addr, dp.clone(), dc.clone(), false);
+                                        // Запускаем run() в фоне
+                                        let conn_handle = tokio::spawn(async move { conn.run(reader, writer).await; });
+                                        // Ждём 100ms чтобы run() создал каналы
+                                        tokio::time::sleep(Duration::from_millis(200)).await;
+                                        // Теперь отправляем BlobRequest
+                                        tracing::info!("[ATP] Sending BlobRequest for {}", hex::encode(&dk.public_key().to_bytes()));
+                                        if let Some(ref rep) = dc.replication {
+                                            let req = AtpMessage::BlobRequest { blob_hashes: vec![dk.public_key().to_bytes()] };
+                                            if let Ok(data) = bincode::serialize(&req) { dp.send_to(&peer_id, data); }
+                                        }
+                                        let _ = conn_handle.await;
                                         break;
                                     }
                                     Err(_) => {}
@@ -188,7 +199,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tokio::spawn(async move {
                             match aevum_node::p2p::peers::accept_connection(stream, kc, &tc).await {
                                 Ok((cipher, peer_id, remote_addr, reader, writer)) => {
-                                    tracing::info!("✅ Accepted from {}", hex::encode(&peer_id));
+                                    tracing::info!("[ATP] ✅ Accepted from {}", hex::encode(&peer_id));
                                     AtpConnection::new(cipher, peer_id, remote_addr, pc, cc, true).run(reader, writer).await;
                                 }
                                 Err(e) => tracing::warn!("Accept failed: {}", e),
@@ -207,7 +218,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mempool_http = mempool.clone(); let validator_http = validator.clone(); let peers_http = peers.clone();
     let shutdown_http = shutdown.clone(); let start_time_http = start_time;
     std::thread::spawn(move || {
-            tracing::info!("⛏️  Mining thread started");
         let addr = format!("0.0.0.0:{}", http_port);
         let server = match tiny_http::Server::http(&addr) { Ok(s) => s, Err(e) => { tracing::error!("HTTP: {}", e); return; } };
         tracing::info!("HTTP API on http://{}", addr);
@@ -235,9 +245,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // ============================================================
     // МАЙНИНГ
-    // ============================================================
     let mut mining_handle = None;
     if let Some(mk) = miner_key {
         let vm = validator.clone(); let mm = mempool.clone(); let sm = storage.clone();
@@ -267,10 +275,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         st.save_block(&block).ok(); if let Err(e) = st.save_utxo_set(val.utxo_set()) { tracing::error!("Failed to save UTXO: {}", e); }
                         let _ = bincode::serialize(&val.poh_snapshot()).ok().and_then(|s| st.save_metadata(POH_SNAPSHOT_KEY, &s).ok());
                         let _ = bincode::serialize(&*serial).ok().and_then(|s| st.save_metadata(SERIAL_COUNTER_KEY, &s).ok());
-                        // UTXO снапшот каждые 1000 блоков
-                        if height % 1000 == 0 {
-                            let _ = SnapshotManager::save_if_needed(&sm, height, val.utxo_set());
-                        }
+                        if height % 1000 == 0 { let _ = SnapshotManager::save_if_needed(&sm, height, val.utxo_set()); }
                         drop(val); drop(st); drop(serial);
                         tracing::info!("⛏️  Mined block at height {}", height);
                         let status = create_status(&s_m);
@@ -285,7 +290,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Heartbeat
     let hb_ctx = sync_ctx.clone(); let hb_peers = peers.clone(); let shutdown_hb = shutdown.clone();
     std::thread::spawn(move || {
-            tracing::info!("⛏️  Mining thread started");
         while !shutdown_hb.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_secs(30));
             let h = hb_ctx.validator.lock().unwrap().last_block_height();
