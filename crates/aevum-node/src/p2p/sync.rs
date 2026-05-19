@@ -37,6 +37,7 @@ pub struct SyncContext {
     pub storage: Arc<StdMutex<Storage>>,
     pub chain_sync: Arc<StdMutex<ChainSync>>,
     pub block_buffer: Arc<StdMutex<BTreeMap<u64, Vec<u8>>>>,
+    pub dht: Arc<StdMutex<crate::p2p::dht::Dht>>,
     pub replication: Option<Arc<StdMutex<crate::encrypted_replication::EncryptedReplication>>>,
 }
 

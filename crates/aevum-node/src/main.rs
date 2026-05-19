@@ -100,6 +100,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(snap) = bincode::deserialize::<PohSnapshot>(&snap) { validator.restore_poh_from_snapshot(&snap); }
     }
     let utxo_set = storage.lock().unwrap().load_utxo_set().unwrap_or_else(|_| UtxoSet::new());
+    // Пробуем загрузить снапшот если UTXO пуст
+    if utxo_set.is_empty() {
+        if let Ok(Some((snap_height, snap_utxo))) = SnapshotManager::load_nearest(&storage, max_height) {
+            tracing::info!("Loaded UTXO snapshot from height {}, applying...", snap_height);
+            validator.load_utxo_set(snap_utxo);
+            validator.genesis_applied = true;
+        }
+    }
     if !utxo_set.is_empty() {
         validator.load_utxo_set(utxo_set);
         validator.genesis_applied = true;
@@ -123,6 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let peer_scoring = Arc::new(StdMutex::new(PeerScoring::new()));
     let addr_manager = Arc::new(StdMutex::new(AddrManager::new(10000)));
 
+    let dht = Arc::new(StdMutex::new(aevum_node::p2p::dht::Dht::new(blake3::hash(&our_key.public_key().to_bytes()).into())));
     let replication = Arc::new(StdMutex::new(EncryptedReplication::new(miner_key.clone(), 1000)));
     let sync_ctx = Arc::new(SyncContext {
         validator: validator.clone(),
@@ -130,6 +139,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         chain_sync: chain_sync.clone(),
         block_buffer: block_buffer.clone(),
         replication: Some(replication.clone()),
+        dht: dht.clone(),
     });
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -257,7 +267,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let (tick_result, txs_backup, height, poh) = {
                     let mut val = vm.lock().unwrap(); let mut mem = mm.lock().unwrap();
                     val.tick_poh(); let poh = val.poh().current_tick_number();
-                    if poh % 30 == 0 || !mem.is_empty() { (true, mem.take_batch(100), val.last_block_height() + 1, poh) }
+                    let active_miners = pm.peer_count().max(1) as u64;
+                    let target_ticks = 100u64.saturating_sub((active_miners / 10).min(80)); // 30сек при 1 майнере, 6сек при 1000+
+                    if poh % target_ticks == 0 || !mem.is_empty() { (true, mem.take_batch(100), val.last_block_height() + 1, poh) }
                     else { (false, vec![], 0, poh) }
                 };
                 if tick_result {
@@ -293,6 +305,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         while !shutdown_hb.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_secs(30));
             let h = hb_ctx.validator.lock().unwrap().last_block_height();
+            // DHT cleanup + refresh каждые 30 минут
+            if h % 60 == 0 {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                if let Some(ref dht) = hb_ctx.dht.lock().ok().as_deref() { } // placeholder
+            }
             tracing::info!("❤️ Heartbeat: height={}, peers={}", h, hb_peers.peer_count());
             let status = create_status(&hb_ctx);
             if let Ok(data) = bincode::serialize(&status) { hb_peers.broadcast(data); }
