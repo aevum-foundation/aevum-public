@@ -14,7 +14,6 @@ pub struct ForkResolver;
 
 impl ForkResolver {
     /// Разрешить форк: сравнить нашу цепь с чужой
-    /// foreign_blocks — блоки чужой цепи, начиная с первого расходящегося
     pub fn resolve(
         validator: &Arc<StdMutex<Validator>>,
         storage: &Arc<StdMutex<Storage>>,
@@ -28,6 +27,22 @@ impl ForkResolver {
         let our_height = val.last_block_height();
         let foreign_height = foreign_blocks.last().unwrap().height;
         let first_foreign = &foreign_blocks[0];
+
+        // 🔥 КРИТИЧЕСКИЙ ФИКС: если мы на высоте 0 (пустая БД) и пир прислал блоки —
+        // значит мы только стартанули и не должны иметь своих блоков.
+        // Берём цепочку пира без вопросов.
+        if our_height == 0 {
+            tracing::info!(
+                "[Fork] Пустая БД (height=0) — принимаем цепочку пира ({} блоков, высоты {}-{})",
+                foreign_blocks.len(),
+                first_foreign.height,
+                foreign_height
+            );
+            return ForkDecision::ForeignChainWins {
+                from_height: 1,
+                blocks: foreign_blocks.to_vec(),
+            };
+        }
 
         if foreign_height <= our_height {
             return ForkDecision::OurChainWins;
@@ -73,7 +88,9 @@ impl ForkResolver {
                 }
             }
         }
-        Some(first_foreign.height.saturating_sub(1))
+        // 🔥 Если не нашли общего предка и мы не на высоте 0 — значит форк непримиримый.
+        // Возвращаем 0 (генезис) как точку расхождения.
+        Some(0)
     }
 
     fn sum_ticks_from(storage: &Arc<StdMutex<Storage>>, from: u64, to: u64) -> u64 {
@@ -87,7 +104,7 @@ impl ForkResolver {
         total
     }
 
-    /// Применить чужую цепь (без отката — просто применяем поверх)
+    /// Применить чужую цепь
     pub fn apply_foreign_chain(
         validator: &Arc<StdMutex<Validator>>,
         storage: &Arc<StdMutex<Storage>>,

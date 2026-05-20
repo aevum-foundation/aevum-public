@@ -1,4 +1,5 @@
 use aevum::core::compute::{ComputeTask, TaskType};
+use aevum::core::escrow::EscrowContract;
 use aevum::crypto::hash::Hash;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -43,6 +44,7 @@ pub struct TaskSolution {
 pub struct TaskMarket {
     pub orders: HashMap<Hash, TaskOrder>,
     pub solutions: HashMap<Hash, Vec<TaskSolution>>,
+    pub escrows: HashMap<Hash, EscrowContract>,
     pub fee_percent: u64,
     pub pool_fees: u64,
     max_orders: usize,
@@ -53,6 +55,7 @@ impl TaskMarket {
         TaskMarket {
             orders: HashMap::new(),
             solutions: HashMap::new(),
+            escrows: HashMap::new(),
             fee_percent,
             pool_fees: 0,
             max_orders: 100_000,
@@ -120,6 +123,8 @@ impl TaskMarket {
         }
 
         self.orders.insert(order_id, order);
+        let escrow = EscrowContract::new(aevum::crypto::keys::PublicKey::from_bytes(customer).unwrap_or_else(|_| aevum::crypto::keys::Keypair::generate().public), task.reward, order_id, current_height, task.deadline);
+        self.escrows.insert(order_id, escrow);
         order_id
     }
 
@@ -207,6 +212,18 @@ impl TaskMarket {
             return Err("Solution not found");
         }
         order.status = OrderStatus::Solved;
+        // Распределяем награду через escrow
+        if let Some(escrow) = self.escrows.get(order_id) {
+            if escrow.status == aevum::core::escrow::EscrowStatus::Funded || escrow.status == aevum::core::escrow::EscrowStatus::InProgress {
+                let payouts = escrow.distribute_reward();
+                tracing::info!("Escrow payout: {} recipients, total reward: {}", payouts.len(), escrow.total_reward);
+                // В production: создаём транзакции для каждого получателя
+                // Сейчас: логируем распределение
+                for (recipient, amount) in &payouts {
+                    tracing::info!("  Payout: {} -> {}", hex::encode(recipient.to_bytes()), amount);
+                }
+            }
+        }
         tracing::info!("Solution verified, order solved: {}", hex::encode(order_id.as_bytes()));
         Ok(())
     }

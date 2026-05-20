@@ -43,7 +43,7 @@ impl PeerExchange {
 }
 
 /// SocketAddr → 18 байт (16 IP + 2 port)
-fn socket_to_bytes(addr: &SocketAddr) -> PeerAddr {
+pub fn socket_to_bytes(addr: &SocketAddr) -> PeerAddr {
     match addr.ip() {
         IpAddr::V4(v4) => {
             let mut ip = [0u8; 16];
@@ -55,7 +55,7 @@ fn socket_to_bytes(addr: &SocketAddr) -> PeerAddr {
 }
 
 /// 18 байт → SocketAddr
-fn bytes_to_socket(ip: [u8; 16], port: u16) -> Option<SocketAddr> {
+pub fn bytes_to_socket(ip: [u8; 16], port: u16) -> Option<SocketAddr> {
     if ip[..10] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff] || ip[..12].iter().all(|&b| b == 0) {
         // IPv4-mapped IPv6 или чистый IPv4
         Some(SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15])), port))

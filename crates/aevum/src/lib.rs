@@ -9,4 +9,3 @@ pub use crate::core::compute::ComputeEngine;
 pub mod error;
 pub use oracle::consensus::OracleConsensus;
 pub mod zk;
-pub mod zk_vm;

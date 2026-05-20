@@ -1,6 +1,6 @@
 use aevum::crypto::keys::{PublicKey, PrivateKey};
 use sha2::{Sha256, Digest};
-// use hmac removed - using SHA256 instead
+use hmac::{Hmac, Mac};
 use chacha20::ChaCha20;
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use rand::RngCore;
@@ -9,6 +9,7 @@ use std::time::Duration;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
+type HmacSha256 = Hmac<Sha256>;
 
 pub fn peer_id_from_pubkey(pk: &PublicKey) -> [u8; 20] {
     let hash = Sha256::digest(pk.to_bytes());
@@ -144,17 +145,11 @@ fn derive_key(secret: &[u8; 32], index: u64, direction: &[u8]) -> [u8; 32] {
 }
 
 fn compute_hmac(secret: &[u8; 32], index: u64, nonce: &[u8], ciphertext: &[u8]) -> [u8; 32] {
-    use sha2::{Sha256, Digest};
-    let mut hasher = Sha256::new();
-    hasher.update(secret);
-    hasher.update(&index.to_le_bytes());
-    hasher.update(nonce);
-    hasher.update(ciphertext);
-    let hash = hasher.finalize();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&hash);
-    out
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC key");
+    mac.update(&index.to_le_bytes()); mac.update(nonce); mac.update(ciphertext);
+    mac.finalize().into_bytes().into()
 }
+
 #[derive(Clone)]
 pub struct TofuStore {
     pub keys: std::collections::HashMap<std::net::SocketAddr, PublicKey>,

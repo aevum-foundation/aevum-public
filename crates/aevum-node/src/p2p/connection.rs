@@ -1,9 +1,10 @@
 use crate::p2p::peers::PeersManager;
 use crate::p2p::sync::{AtpMessage, SyncContext, create_status, handle_atp_message};
 use crate::p2p::noise::AtpCipher;
+use crate::p2p::pex::PeerExchange;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 use std::net::SocketAddr;
@@ -51,24 +52,33 @@ impl AtpConnection {
         }
     }
 
-    pub fn send_or_buffer(&mut self, data: Vec<u8>) {
-        if self.peer_ready && self.we_sent_ready {
-            if let Some(ref tx) = self.outgoing_tx {
-                let _ = tx.try_send(data);
-                return;
-            }
-        }
-        self.pending_outgoing.push(data);
-    }
-
     pub fn on_peer_ready(&mut self) {
         self.peer_ready = true;
-        // Запускаем синхронизацию: запрашиваем блоки у пира
         let our_height = self.ctx.validator.lock().unwrap().last_block_height();
+
+        // Отправляем статус для синхронизации
         let status = create_status(&self.ctx);
-        let data = bincode::serialize(&status).unwrap_or_default();
-        self.pending_outgoing.push(data);
-        tracing::info!("[ATP] Sync initiated after handshake: our_height={}", our_height);
+        if let Ok(data) = bincode::serialize(&status) {
+            self.pending_outgoing.push(data);
+        }
+
+        // PEX: отправляем список известных пиров
+        let pex_msg = PeerExchange::create_peer_list(&self.peers, 20);
+        if let Ok(data) = bincode::serialize(&pex_msg) {
+            self.pending_outgoing.push(data);
+        }
+
+        // DHT: добавляем пира
+        let dht = &self.ctx.dht;
+        let mut node_id = [0u8; 32];
+        let hash = blake3::hash(self.addr.to_string().as_bytes());
+        node_id.copy_from_slice(&hash.as_bytes()[..32]);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        dht.lock().unwrap().add_or_update(node_id, self.addr, now);
+
+        tracing::info!("[ATP] Sync + PEX + DHT initiated: our_height={}", our_height);
+        tracing::info!("[ATP] on_peer_ready: pending_outgoing={}", self.pending_outgoing.len());
         self.flush_buffer();
     }
 
@@ -83,8 +93,10 @@ impl AtpConnection {
     }
 
     pub async fn run(mut self, mut reader: ReadHalf<TcpStream>, mut writer: WriteHalf<TcpStream>) {
+        tracing::info!("[ATP] run() START — is_server={}", self.is_server);
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
         self.outgoing_tx = Some(tx);
+        tracing::info!("[ATP] register_peer: peer_id={}", hex::encode(&self.peer_id));
         self.peers.register_peer(self.peer_id, self.addr, self.outgoing_tx.as_ref().unwrap().clone());
 
         let send_cipher = self.send_cipher.clone();
@@ -95,63 +107,48 @@ impl AtpConnection {
 
         // HANDSHAKE
         if self.is_server {
+            tracing::info!("[ATP] SERVER: waiting for client status...");
             match Self::read_msg(&mut reader).await {
                 Ok(encrypted) => {
                     if let Some(p) = recv_cipher.lock().unwrap().decrypt(&encrypted) {
                         if let Ok(msg) = bincode::deserialize::<AtpMessage>(&p) {
                             let ctx_h = ctx.clone(); let peers_h = peers.clone(); let pid = peer_id;
                             tokio::spawn(async move { handle_atp_message(msg, &ctx_h, &pid, &peers_h); });
-                            // Если это ReadySignal — обрабатываем
-                            if let Ok(AtpMessage::ReadySignal) = bincode::deserialize::<AtpMessage>(&p) {
-                                self.on_peer_ready();
-                            }
                         }
                     }
                 }
-                Err(e) => { tracing::warn!("[ATP] Handshake read failed: {}", e); return; }
+                Err(e) => { tracing::warn!("[ATP] SERVER: read_msg FAILED: {}", e); return; }
             }
+            tracing::info!("[ATP] SERVER: sending status + ReadySignal");
             Self::send_status(&send_cipher, &ctx, &mut writer, &peer_id).await;
-            // Send ReadySignal
             Self::send_ready(&send_cipher, &mut writer).await;
             self.we_sent_ready = true;
+        tracing::info!("[ATP] on_peer_ready: pending_outgoing={}", self.pending_outgoing.len());
             self.flush_buffer();
         } else {
+            tracing::info!("[ATP] CLIENT: sending status + ReadySignal");
             Self::send_status(&send_cipher, &ctx, &mut writer, &peer_id).await;
             Self::send_ready(&send_cipher, &mut writer).await;
             self.we_sent_ready = true;
+        tracing::info!("[ATP] on_peer_ready: pending_outgoing={}", self.pending_outgoing.len());
             self.flush_buffer();
+            tracing::info!("[ATP] CLIENT: waiting for server status...");
             match Self::read_msg(&mut reader).await {
                 Ok(encrypted) => {
                     if let Some(p) = recv_cipher.lock().unwrap().decrypt(&encrypted) {
                         if let Ok(msg) = bincode::deserialize::<AtpMessage>(&p) {
                             let ctx_h = ctx.clone(); let peers_h = peers.clone(); let pid = peer_id;
                             tokio::spawn(async move { handle_atp_message(msg, &ctx_h, &pid, &peers_h); });
-                            if let Ok(AtpMessage::ReadySignal) = bincode::deserialize::<AtpMessage>(&p) {
-                                self.on_peer_ready();
-                            }
                         }
                     }
                 }
-                Err(e) => { tracing::warn!("[ATP] Handshake read failed: {}", e); return; }
+                Err(e) => { tracing::warn!("[ATP] CLIENT: read_msg FAILED: {}", e); return; }
             }
         }
 
-        // Wait for peer ReadySignal if not received yet
-        if !self.peer_ready {
-            match Self::read_msg(&mut reader).await {
-                Ok(encrypted) => {
-                    if let Some(p) = recv_cipher.lock().unwrap().decrypt(&encrypted) {
-                        if let Ok(AtpMessage::ReadySignal) = bincode::deserialize(&p) {
-                            self.on_peer_ready();
-                        }
-                    }
-                }
-                Err(e) => { tracing::warn!("[ATP] ReadySignal wait failed: {}", e); return; }
-            }
-        }
-
-        self.state = ConnState::Active;
-        tracing::info!("[ATP] Active loop started: peer_id={}", hex::encode(&peer_id));
+        // Вызываем on_peer_ready после handshake
+        self.on_peer_ready();
+        tracing::info!("[ATP] Handshake done, entering active loop");
 
         // ACTIVE LOOP
         loop {
@@ -174,6 +171,12 @@ impl AtpConnection {
                         Ok(encrypted) => {
                             if let Some(plaintext) = recv_cipher.lock().unwrap().decrypt(&encrypted) {
                                 if let Ok(msg) = bincode::deserialize::<AtpMessage>(&plaintext) {
+                                    // PEX: обрабатываем список пиров
+                                    if let AtpMessage::PeerList { ref addrs } = msg {
+                                        let now = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                        PeerExchange::process_peer_list(addrs, &peers, now);
+                                    }
                                     handle_atp_message(msg, &ctx, &peer_id, &peers);
                                 }
                             }

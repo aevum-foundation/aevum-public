@@ -5,3 +5,5 @@ pub mod economics;
 pub mod jt_utxo;
 pub mod state;
 pub mod transaction;
+pub mod wire;
+pub mod escrow;
