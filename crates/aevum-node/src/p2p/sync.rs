@@ -40,16 +40,12 @@ pub struct SyncContext {
     pub replication: Option<Arc<StdMutex<crate::encrypted_replication::EncryptedReplication>>>,
 }
 
-/// Callback при получении ReadySignal от пира
-pub type ReadyCallback = Arc<StdMutex<Option<Box<dyn FnOnce() + Send>>>>;
-
 pub fn handle_atp_message(
     msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8; 20], peers: &Arc<PeersManager>,
 ) {
     match msg {
         AtpMessage::ReadySignal => {
             tracing::info!("[SYNC] ReadySignal received from {}", hex::encode(peer_id));
-            // ReadySignal обрабатывается в connection.rs через колбэк
         }
         AtpMessage::Status { height, .. } => {
             let my = ctx.validator.lock().unwrap().last_block_height();
@@ -57,6 +53,7 @@ pub fn handle_atp_message(
             if height > my {
                 let from = if my == 0 { 1 } else { my + 1 };
                 let req = AtpMessage::HeaderRequest { from, to: height };
+                if let Ok(data) = bincode::serialize(&req) { peers.send_to(peer_id, data); }
             }
         }
         AtpMessage::HeaderRequest { from, to } => {
@@ -84,6 +81,7 @@ pub fn handle_atp_message(
                         from: my + 1,
                         to: (my + MAX_BLOCKS_PER_REQUEST).min(last.height),
                     };
+                    if let Ok(data) = bincode::serialize(&req) { peers.send_to(peer_id, data); }
                 }
             }
         }
@@ -98,6 +96,7 @@ pub fn handle_atp_message(
             }
             drop(st);
             let resp = AtpMessage::BlockResponse { request_id, blocks };
+            if let Ok(data) = bincode::serialize(&resp) { peers.send_to(peer_id, data); }
         }
         AtpMessage::BlockResponse { blocks, .. } => {
             let mut buffer = ctx.block_buffer.lock().unwrap();
@@ -118,6 +117,7 @@ pub fn handle_atp_message(
         }
         AtpMessage::Ping { nonce } => {
             let pong = AtpMessage::Pong { nonce };
+            if let Ok(data) = bincode::serialize(&pong) { peers.send_to(peer_id, data); }
         }
         _ => {}
     }
