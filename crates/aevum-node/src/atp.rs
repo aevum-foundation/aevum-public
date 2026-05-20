@@ -35,6 +35,8 @@ impl AtpNode {
             storage,
             chain_sync,
             block_buffer: Arc::new(StdMutex::new(BTreeMap::new())),
+            replication: None,
+            dht: Arc::new(StdMutex::new(crate::p2p::dht::Dht::new([0u8; 32]))),
         });
 
         Ok(Self {

@@ -1,4 +1,4 @@
 use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ZkAccept;
-impl ZkAccept { pub fn new() -> Self { ZkAccept } }
+pub struct ZkJuris;
+impl ZkJuris { pub fn new() -> Self { ZkJuris } }

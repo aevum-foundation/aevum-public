@@ -6,3 +6,4 @@ pub mod atp;
 pub mod science_api;
 pub mod task_market;
 pub mod task_pool;
+pub mod encrypted_replication;

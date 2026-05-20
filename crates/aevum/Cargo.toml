@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+thiserror = "1"
 curve25519-dalek = { version = "4", features = ["legacy_compatibility"] }
 sha2 = "0.10"
 blake3 = "1"
