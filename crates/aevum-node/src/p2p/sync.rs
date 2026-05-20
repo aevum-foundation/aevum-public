@@ -73,6 +73,7 @@ pub fn handle_atp_message(
             }
             drop(st);
             let resp = AtpMessage::HeaderResponse { headers };
+            if let Ok(data) = bincode::serialize(&resp) { peers.send_to(peer_id, data); }
         }
         AtpMessage::HeaderResponse { headers } => {
             if let Some(last) = headers.last() {
