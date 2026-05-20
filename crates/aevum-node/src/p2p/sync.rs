@@ -57,7 +57,6 @@ pub fn handle_atp_message(
             if height > my {
                 let from = if my == 0 { 1 } else { my + 1 };
                 let req = AtpMessage::HeaderRequest { from, to: height };
-                if let Ok(data) = bincode::serialize(&req) { let sent = peers.send_to(peer_id, data); tracing::info!("[SYNC] send_to {}: {}", hex::encode(peer_id), sent); }
             }
         }
         AtpMessage::HeaderRequest { from, to } => {
@@ -74,7 +73,6 @@ pub fn handle_atp_message(
             }
             drop(st);
             let resp = AtpMessage::HeaderResponse { headers };
-            if let Ok(data) = bincode::serialize(&resp) { { let sent = peers.send_to(peer_id, data); tracing::info!("[SYNC] send_to {}: {}", hex::encode(peer_id), sent); }; }
         }
         AtpMessage::HeaderResponse { headers } => {
             if let Some(last) = headers.last() {
@@ -85,7 +83,6 @@ pub fn handle_atp_message(
                         from: my + 1,
                         to: (my + MAX_BLOCKS_PER_REQUEST).min(last.height),
                     };
-                    if let Ok(data) = bincode::serialize(&req) { let sent = peers.send_to(peer_id, data); tracing::info!("[SYNC] send_to {}: {}", hex::encode(peer_id), sent); }
                 }
             }
         }
@@ -100,7 +97,6 @@ pub fn handle_atp_message(
             }
             drop(st);
             let resp = AtpMessage::BlockResponse { request_id, blocks };
-            if let Ok(data) = bincode::serialize(&resp) { { let sent = peers.send_to(peer_id, data); tracing::info!("[SYNC] send_to {}: {}", hex::encode(peer_id), sent); }; }
         }
         AtpMessage::BlockResponse { blocks, .. } => {
             let mut buffer = ctx.block_buffer.lock().unwrap();
@@ -121,7 +117,6 @@ pub fn handle_atp_message(
         }
         AtpMessage::Ping { nonce } => {
             let pong = AtpMessage::Pong { nonce };
-            if let Ok(data) = bincode::serialize(&pong) { { let sent = peers.send_to(peer_id, data); tracing::info!("[SYNC] send_to {}: {}", hex::encode(peer_id), sent); }; }
         }
         _ => {}
     }

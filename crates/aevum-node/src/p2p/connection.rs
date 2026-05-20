@@ -78,7 +78,6 @@ impl AtpConnection {
         dht.lock().unwrap().add_or_update(node_id, self.addr, now);
 
         tracing::info!("[ATP] Sync + PEX + DHT initiated: our_height={}", our_height);
-        tracing::info!("[ATP] on_peer_ready: pending_outgoing={}", self.pending_outgoing.len());
         self.flush_buffer();
     }
 
@@ -96,7 +95,6 @@ impl AtpConnection {
         tracing::info!("[ATP] run() START — is_server={}", self.is_server);
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
         self.outgoing_tx = Some(tx);
-        tracing::info!("[ATP] register_peer: peer_id={}", hex::encode(&self.peer_id));
         self.peers.register_peer(self.peer_id, self.addr, self.outgoing_tx.as_ref().unwrap().clone());
 
         let send_cipher = self.send_cipher.clone();
@@ -123,14 +121,12 @@ impl AtpConnection {
             Self::send_status(&send_cipher, &ctx, &mut writer, &peer_id).await;
             Self::send_ready(&send_cipher, &mut writer).await;
             self.we_sent_ready = true;
-        tracing::info!("[ATP] on_peer_ready: pending_outgoing={}", self.pending_outgoing.len());
             self.flush_buffer();
         } else {
             tracing::info!("[ATP] CLIENT: sending status + ReadySignal");
             Self::send_status(&send_cipher, &ctx, &mut writer, &peer_id).await;
             Self::send_ready(&send_cipher, &mut writer).await;
             self.we_sent_ready = true;
-        tracing::info!("[ATP] on_peer_ready: pending_outgoing={}", self.pending_outgoing.len());
             self.flush_buffer();
             tracing::info!("[ATP] CLIENT: waiting for server status...");
             match Self::read_msg(&mut reader).await {
