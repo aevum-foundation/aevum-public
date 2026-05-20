@@ -3,7 +3,7 @@ use crate::p2p::sync::{AtpMessage, SyncContext, create_status, handle_atp_messag
 use crate::p2p::noise::AtpCipher;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 use std::net::SocketAddr;
@@ -27,13 +27,9 @@ pub struct AtpConnection {
     recv_cipher: Arc<StdMutex<AtpCipher>>,
     peers: Arc<PeersManager>,
     ctx: Arc<SyncContext>,
-    /// Буфер исходящих до полной готовности
-    pending_outgoing: Vec<Vec<u8>>,
-    /// Пир прислал ReadySignal?
     peer_ready: bool,
-    /// Мы отправили ReadySignal?
     we_sent_ready: bool,
-    /// Канал отправки (заполняется в run)
+    pending_outgoing: Vec<Vec<u8>>,
     outgoing_tx: Option<mpsc::Sender<Vec<u8>>>,
 }
 
@@ -50,14 +46,11 @@ impl AtpConnection {
             state: ConnState::Handshaking,
             stats: PeerStats { connected_at: Some(Instant::now()), ..Default::default() },
             send_cipher, recv_cipher,
-            pending_outgoing: Vec::new(),
-            peer_ready: false,
-            we_sent_ready: false,
-            outgoing_tx: None,
+            peer_ready: false, we_sent_ready: false,
+            pending_outgoing: Vec::new(), outgoing_tx: None,
         }
     }
 
-    /// Отправить или буферизовать (Thread-safe через outgoing_tx)
     pub fn send_or_buffer(&mut self, data: Vec<u8>) {
         if self.peer_ready && self.we_sent_ready {
             if let Some(ref tx) = self.outgoing_tx {
@@ -68,20 +61,14 @@ impl AtpConnection {
         self.pending_outgoing.push(data);
     }
 
-    /// Пир прислал ReadySignal — разблокируем буфер
     pub fn on_peer_ready(&mut self) {
         self.peer_ready = true;
-        self.flush_buffer();
-    }
-
-    /// Отправляем ReadySignal пиру
-    pub fn send_ready_signal(&mut self) {
-        self.we_sent_ready = true;
-        if let Some(ref tx) = self.outgoing_tx {
-            if let Ok(data) = bincode::serialize(&AtpMessage::ReadySignal) {
-                let _ = tx.try_send(data);
-            }
-        }
+        // Запускаем синхронизацию: запрашиваем блоки у пира
+        let our_height = self.ctx.validator.lock().unwrap().last_block_height();
+        let status = create_status(&self.ctx);
+        let data = bincode::serialize(&status).unwrap_or_default();
+        self.pending_outgoing.push(data);
+        tracing::info!("[ATP] Sync initiated after handshake: our_height={}", our_height);
         self.flush_buffer();
     }
 
@@ -96,96 +83,75 @@ impl AtpConnection {
     }
 
     pub async fn run(mut self, mut reader: ReadHalf<TcpStream>, mut writer: WriteHalf<TcpStream>) {
-        tracing::info!("[ATP] run() START — is_server={}", self.is_server);
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
-        self.outgoing_tx = Some(tx.clone());
-        self.peers.register_peer(self.peer_id, self.addr, tx);
+        self.outgoing_tx = Some(tx);
+        self.peers.register_peer(self.peer_id, self.addr, self.outgoing_tx.as_ref().unwrap().clone());
 
         let send_cipher = self.send_cipher.clone();
         let recv_cipher = self.recv_cipher.clone();
         let peers = self.peers.clone();
         let ctx = self.ctx.clone();
         let peer_id = self.peer_id;
-        let is_server = self.is_server;
 
         // HANDSHAKE
-        if is_server {
-            tracing::info!("[ATP] SERVER: waiting for client status...");
+        if self.is_server {
             match Self::read_msg(&mut reader).await {
                 Ok(encrypted) => {
-                    match recv_cipher.lock().unwrap().decrypt(&encrypted) {
-                        Some(p) => {
-                            if let Ok(msg) = bincode::deserialize::<AtpMessage>(&p) {
-                                let ctx_h = ctx.clone(); let peers_h = peers.clone(); let pid = peer_id;
-                                tokio::spawn(async move { handle_atp_message(msg, &ctx_h, &pid, &peers_h); });
+                    if let Some(p) = recv_cipher.lock().unwrap().decrypt(&encrypted) {
+                        if let Ok(msg) = bincode::deserialize::<AtpMessage>(&p) {
+                            let ctx_h = ctx.clone(); let peers_h = peers.clone(); let pid = peer_id;
+                            tokio::spawn(async move { handle_atp_message(msg, &ctx_h, &pid, &peers_h); });
+                            // Если это ReadySignal — обрабатываем
+                            if let Ok(AtpMessage::ReadySignal) = bincode::deserialize::<AtpMessage>(&p) {
+                                self.on_peer_ready();
                             }
                         }
-                        None => tracing::warn!("[ATP] SERVER: decrypt FAILED"),
                     }
                 }
-                Err(e) => tracing::warn!("[ATP] SERVER: read_msg FAILED: {}", e),
+                Err(e) => { tracing::warn!("[ATP] Handshake read failed: {}", e); return; }
             }
-            tracing::info!("[ATP] SERVER: sending status + ReadySignal");
             Self::send_status(&send_cipher, &ctx, &mut writer, &peer_id).await;
-            // Отправляем ReadySignal после статуса
-            // Отправляем ReadySignal напрямую в writer
-            let ready_data = bincode::serialize(&AtpMessage::ReadySignal).unwrap_or_default();
-            let encrypted = send_cipher.lock().unwrap().encrypt(&ready_data);
-            let len = (encrypted.len() as u32).to_be_bytes();
-            let mut packet = Vec::with_capacity(4 + encrypted.len());
-            packet.extend_from_slice(&len); packet.extend_from_slice(&encrypted);
-            let _ = writer.write_all(&packet).await;
-            let _ = writer.flush().await;
-            tracing::info!("[ATP] ReadySignal sent directly");
+            // Send ReadySignal
+            Self::send_ready(&send_cipher, &mut writer).await;
             self.we_sent_ready = true;
+            self.flush_buffer();
         } else {
-            tracing::info!("[ATP] CLIENT: sending status + ReadySignal");
             Self::send_status(&send_cipher, &ctx, &mut writer, &peer_id).await;
-            // Отправляем ReadySignal напрямую в writer
-            let ready_data = bincode::serialize(&AtpMessage::ReadySignal).unwrap_or_default();
-            let encrypted = send_cipher.lock().unwrap().encrypt(&ready_data);
-            let len = (encrypted.len() as u32).to_be_bytes();
-            let mut packet = Vec::with_capacity(4 + encrypted.len());
-            packet.extend_from_slice(&len); packet.extend_from_slice(&encrypted);
-            let _ = writer.write_all(&packet).await;
-            let _ = writer.flush().await;
-            tracing::info!("[ATP] ReadySignal sent directly");
+            Self::send_ready(&send_cipher, &mut writer).await;
             self.we_sent_ready = true;
-            tracing::info!("[ATP] CLIENT: waiting for server status...");
+            self.flush_buffer();
             match Self::read_msg(&mut reader).await {
                 Ok(encrypted) => {
-                    match recv_cipher.lock().unwrap().decrypt(&encrypted) {
-                        Some(p) => {
-                            if let Ok(msg) = bincode::deserialize::<AtpMessage>(&p) {
-                                let ctx_h = ctx.clone(); let peers_h = peers.clone(); let pid = peer_id;
-                                tokio::spawn(async move { handle_atp_message(msg, &ctx_h, &pid, &peers_h); });
+                    if let Some(p) = recv_cipher.lock().unwrap().decrypt(&encrypted) {
+                        if let Ok(msg) = bincode::deserialize::<AtpMessage>(&p) {
+                            let ctx_h = ctx.clone(); let peers_h = peers.clone(); let pid = peer_id;
+                            tokio::spawn(async move { handle_atp_message(msg, &ctx_h, &pid, &peers_h); });
+                            if let Ok(AtpMessage::ReadySignal) = bincode::deserialize::<AtpMessage>(&p) {
+                                self.on_peer_ready();
                             }
                         }
-                        None => tracing::warn!("[ATP] CLIENT: decrypt FAILED"),
                     }
                 }
-                Err(e) => tracing::warn!("[ATP] CLIENT: read_msg FAILED: {}", e),
+                Err(e) => { tracing::warn!("[ATP] Handshake read failed: {}", e); return; }
             }
         }
 
-        // Ждём ReadySignal от пира (если ещё не получили)
+        // Wait for peer ReadySignal if not received yet
         if !self.peer_ready {
-            tracing::info!("[ATP] Waiting for peer ReadySignal...");
             match Self::read_msg(&mut reader).await {
                 Ok(encrypted) => {
                     if let Some(p) = recv_cipher.lock().unwrap().decrypt(&encrypted) {
                         if let Ok(AtpMessage::ReadySignal) = bincode::deserialize(&p) {
-                            tracing::info!("[ATP] Peer ReadySignal received");
                             self.on_peer_ready();
                         }
                     }
                 }
-                Err(e) => tracing::warn!("[ATP] ReadySignal wait failed: {}", e),
+                Err(e) => { tracing::warn!("[ATP] ReadySignal wait failed: {}", e); return; }
             }
         }
 
-        tracing::info!("[ATP] Handshake done, entering active loop");
-        // Запрашиваем список пиров у соседа (PEX)
+        self.state = ConnState::Active;
+        tracing::info!("[ATP] Active loop started: peer_id={}", hex::encode(&peer_id));
 
         // ACTIVE LOOP
         loop {
@@ -197,58 +163,54 @@ impl AtpConnection {
                             let len = (encrypted.len() as u32).to_be_bytes();
                             let mut packet = Vec::with_capacity(4 + encrypted.len());
                             packet.extend_from_slice(&len); packet.extend_from_slice(&encrypted);
-                            if writer.write_all(&packet).await.is_err() { tracing::warn!("[ATP] write_all failed"); break; }
+                            if writer.write_all(&packet).await.is_err() { break; }
                             let _ = writer.flush().await;
                         }
-                        None => { tracing::info!("[ATP] rx closed"); break; }
+                        None => break,
                     }
                 }
                 result = Self::read_msg(&mut reader) => {
                     match result {
                         Ok(encrypted) => {
-                            match recv_cipher.lock().unwrap().decrypt(&encrypted) {
-                                Some(plaintext) => {
-                                    if let Ok(msg) = bincode::deserialize::<AtpMessage>(&plaintext) {
-                                        if matches!(msg, AtpMessage::ReadySignal) {
-                                            tracing::info!("[ATP] ReadySignal in active loop");
-                                            self.on_peer_ready();
-                                        } else {
-                                            handle_atp_message(msg, &ctx, &peer_id, &peers);
-                                        }
-                                    }
+                            if let Some(plaintext) = recv_cipher.lock().unwrap().decrypt(&encrypted) {
+                                if let Ok(msg) = bincode::deserialize::<AtpMessage>(&plaintext) {
+                                    handle_atp_message(msg, &ctx, &peer_id, &peers);
                                 }
-                                None => tracing::warn!("[ATP] active decrypt failed"),
                             }
                         }
-                        Err(e) => { tracing::warn!("[ATP] active read_msg failed: {}", e); break; }
+                        Err(_) => break,
                     }
                 }
             }
         }
 
         self.peers.remove_peer(&peer_id);
-        tracing::info!("❌ Disconnected from {}", hex::encode(&peer_id));
+        tracing::info!("[ATP] Disconnected: {}", hex::encode(&peer_id));
     }
 
     async fn send_status(
         send_cipher: &Arc<StdMutex<AtpCipher>>, ctx: &Arc<SyncContext>,
         writer: &mut WriteHalf<TcpStream>, peer_id: &[u8; 20],
-    ) -> bool {
+    ) {
         let ctx2 = ctx.clone();
-        let my_status = match tokio::task::spawn_blocking(move || create_status(&ctx2)).await {
-            Ok(s) => s, Err(e) => { tracing::warn!("create_status: {}", e); return false; }
-        };
-        let data = match bincode::serialize(&my_status) {
-            Ok(d) => d, Err(e) => { tracing::warn!("serialize: {}", e); return false; }
-        };
+        let my_status = tokio::task::spawn_blocking(move || create_status(&ctx2)).await.unwrap();
+        let data = bincode::serialize(&my_status).unwrap_or_default();
         let encrypted = send_cipher.lock().unwrap().encrypt(&data);
         let len = (encrypted.len() as u32).to_be_bytes();
         let mut packet = Vec::with_capacity(4 + encrypted.len());
         packet.extend_from_slice(&len); packet.extend_from_slice(&encrypted);
-        if writer.write_all(&packet).await.is_err() { return false; }
-        if writer.flush().await.is_err() { return false; }
-        tracing::info!("📤 Status sent to {}", hex::encode(peer_id));
-        true
+        let _ = writer.write_all(&packet).await;
+        let _ = writer.flush().await;
+    }
+
+    async fn send_ready(send_cipher: &Arc<StdMutex<AtpCipher>>, writer: &mut WriteHalf<TcpStream>) {
+        let ready_data = bincode::serialize(&AtpMessage::ReadySignal).unwrap_or_default();
+        let encrypted = send_cipher.lock().unwrap().encrypt(&ready_data);
+        let len = (encrypted.len() as u32).to_be_bytes();
+        let mut packet = Vec::with_capacity(4 + encrypted.len());
+        packet.extend_from_slice(&len); packet.extend_from_slice(&encrypted);
+        let _ = writer.write_all(&packet).await;
+        let _ = writer.flush().await;
     }
 
     async fn read_msg(reader: &mut ReadHalf<TcpStream>) -> Result<Vec<u8>, std::io::Error> {

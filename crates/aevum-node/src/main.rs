@@ -180,19 +180,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 match aevum_node::p2p::peers::dial_peer(addr, dk.clone(), &dt).await {
                                     Ok((cipher, peer_id, reader, writer)) => {
                                         tracing::info!("[ATP] ✅ CONNECTED to {}", hex::encode(&peer_id));
-                                        let mut conn = AtpConnection::new(cipher, peer_id, addr, dp.clone(), dc.clone(), false);
-                                        // Запускаем run() в фоне
+                                        let conn = AtpConnection::new(cipher, peer_id, addr, dp.clone(), dc.clone(), false);
+                                        // Запускаем run() — синхронизация запустится автоматически после handshake
                                         let conn_handle = tokio::spawn(async move { conn.run(reader, writer).await; });
-                                        // Ждём 100ms чтобы run() создал каналы
-                                        tokio::time::sleep(Duration::from_millis(200)).await;
-                                        // Теперь отправляем BlobRequest
-                                        tracing::info!("[ATP] Sending BlobRequest for {}", hex::encode(&dk.public_key().to_bytes()));
+                                        // Ждём немного чтобы run() создал каналы
+                                        tokio::time::sleep(Duration::from_millis(100)).await;
                                         // PEX: запрашиваем список пиров
                                         aevum_node::p2p::pex::PeerExchange::request_peers(&dp, &peer_id);
-                                        if let Some(ref rep) = dc.replication {
-                                            let req = AtpMessage::BlobRequest { blob_hashes: vec![dk.public_key().to_bytes()] };
-                                            if let Ok(data) = bincode::serialize(&req) { dp.send_to(&peer_id, data); }
-                                        }
                                         let _ = conn_handle.await;
                                         break;
                                     }
