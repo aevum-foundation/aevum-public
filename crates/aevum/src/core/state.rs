@@ -93,7 +93,7 @@ impl UtxoSet {
     pub fn check_prisma_compatibility(&self, output: &crate::core::transaction::TxOutput) -> Result<(), UtxoSetError> {
         if crate::core::jt_utxo::is_global(output.restriction_level) { return Ok(()); }
         if let Some(policy) = self.get_prisma_policy(&output.owner) {
-            if !policy.accepts_level(output.restriction_level) {
+            if !policy.policy.accepts_level(output.restriction_level) {
                 return Err(UtxoSetError::PrismaRejection { restriction_level: output.restriction_level, owner: output.owner.to_bytes() });
             }
         }
@@ -105,7 +105,7 @@ impl UtxoSet {
             if crate::core::jt_utxo::is_global(input.restriction_level()) { continue; }
             for output in outputs {
                 if let Some(policy) = self.get_prisma_policy(&output.owner) {
-                    if !policy.accepts_level(input.restriction_level()) {
+                    if !policy.policy.accepts_level(input.restriction_level()) {
                         return Err(UtxoSetError::PrismaInputRejection {
                             input_restriction: input.restriction_level(),
                             owner: output.owner.to_bytes(),
@@ -232,7 +232,7 @@ impl UtxoSet {
         }
         for (pubkey, policy) in &self.prisma_policies {
             hasher.update(pubkey);
-            hasher.update(&policy.policy_hash[..]);
+            hasher.update(policy.policy_hash.as_bytes());
         }
         self.state_root = Hash(hasher.finalize().into());
         self.dirty = false;
