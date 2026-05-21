@@ -1,4 +1,5 @@
 use aevum::core::block::Block;
+use aevum::core::jt_utxo::JtUtxo;
 use aevum::core::state::UtxoSet;
 use aevum::crypto::hash::Hash;
 use sha2::{Sha256, Digest};
@@ -64,6 +65,26 @@ impl Storage {
                         }
                     }
                     // Мигрируем nonce
+                    // Мигрируем UTXO из таблицы utxos (если metadata пустая)
+                    let utxo_meta = db.get(Self::meta_key("utxo_set")).ok().flatten();
+                    if utxo_meta.is_none() {
+                        if let Ok(mut stmt) = conn.prepare("SELECT data FROM utxos") {
+                            let mut utxo_set = UtxoSet::new();
+                            if let Ok(rows) = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0)) {
+                                for row in rows {
+                                    if let Ok(data) = row {
+                                        if let Ok(utxo) = bincode::deserialize::<JtUtxo>(&data) {
+                                            utxo_set.add(utxo);
+                                        }
+                                    }
+                                }
+                            }
+                            if !utxo_set.is_empty() {
+                                db.insert(Self::meta_key("utxo_set"), bincode::serialize(&utxo_set).unwrap_or_default())?;
+                                tracing::info!("[STORAGE] Migrated {} UTXOs from SQLite", utxo_set.len());
+                            }
+                        }
+                    }
                     if let Ok(mut stmt) = conn.prepare("SELECT key, value FROM nonces") {
                         if let Ok(rows) = stmt.query_map([], |row| {
                             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))

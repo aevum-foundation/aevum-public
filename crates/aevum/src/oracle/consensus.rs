@@ -1,5 +1,6 @@
 use crate::oracle::conscience::ConscienceOracle;
 use crate::oracle::innocence::InnocenceManager;
+use crate::oracle::onchain_analyzer::OnChainAnalyzer;
 use crate::crypto::hash::Hash;
 use crate::crypto::keys::PublicKey;
 use std::collections::HashMap;
@@ -32,14 +33,17 @@ impl OracleInfo {
     pub fn new(id: u32, pk: PublicKey, name: &str, weight: u8, oracle: ConscienceOracle) -> Self {
         OracleInfo { id, public_key: pk, name: name.to_string(), weight, last_update: 0, reputation: 0, oracle }
     }
-    /// Запросить кросс-чейн риск (заглушка — будет API к Chainalysis/Elliptic)
-    pub fn query_cross_chain_risk(&self, source_chain: u32, source_address: &str) -> Option<(u64, u64, u16, String)> {
-        if source_chain == 0 { Some((crate::core::jt_utxo::CAT_GLOBAL | 0x00, 0, 0, "Bitcoin AML not yet connected".into())) }
-        else { None }
-    }
+
     pub fn query_risk(&self, _address: &[u8; 32]) -> Option<(u64, u64)> {
         if self.oracle.is_empty() { return None; }
         Some((crate::core::jt_utxo::CAT_GLOBAL | 0x00, crate::core::jt_utxo::RISK_SANCTIONS))
+    }
+
+    /// Кросс-чейн AML: анализирует адрес из внешней сети через OnChainAnalyzer
+    pub async fn query_cross_chain_risk(&self, source_chain: u32, source_address: &str) -> Option<(u64, u64, u16, String)> {
+        let mut analyzer = OnChainAnalyzer::new();
+        let analysis = analyzer.analyze(source_chain, source_address).await;
+        Some((analysis.risk_level, analysis.taint_distance as u64, analysis.taint_distance, analysis.taint_origin))
     }
 }
 
@@ -54,9 +58,7 @@ pub struct OracleConsensus {
 impl OracleConsensus {
     pub fn new() -> Self {
         OracleConsensus {
-            oracles: Vec::new(),
-            required_confirmations: 2,
-            min_agreement_percent: 67,
+            oracles: Vec::new(), required_confirmations: 2, min_agreement_percent: 67,
             innocence_manager: InnocenceManager::new(),
         }
     }
@@ -80,13 +82,8 @@ impl OracleConsensus {
         self.innocence_manager.update_risk_root(oracle_id, root);
     }
 
-    pub fn get_sanctions_root(&self) -> Option<Hash> {
-        self.innocence_manager.get_sanctions_root()
-    }
-
-    pub fn get_risk_root(&self) -> Option<Hash> {
-        self.innocence_manager.get_risk_root()
-    }
+    pub fn get_sanctions_root(&self) -> Option<Hash> { self.innocence_manager.get_sanctions_root() }
+    pub fn get_risk_root(&self) -> Option<Hash> { self.innocence_manager.get_risk_root() }
 
     pub fn get_risk_consensus(&self, address: &[u8; 32]) -> ConsensusResult {
         if self.oracles.is_empty() { return ConsensusResult::Unknown; }

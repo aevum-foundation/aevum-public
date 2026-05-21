@@ -162,6 +162,9 @@ impl ChainOrchestrator {
         for h2 in h..=our { if let Ok(Some(b)) = st.load_block(h2) { let d = bincode::serialize(&b).map_err(|e| OrchestratorError::StorageFailed { operation: "ser".into(), detail: format!("{:?}", e) })?; st.save_metadata(&format!("my_block_{}", h2), &d).map_err(|e| OrchestratorError::StorageFailed { operation: "save".into(), detail: format!("{:?}", e) })?; for tx in &b.transactions { if tx.inputs.is_empty() { for o in &tx.outputs { refund += o.amount; rewards.push((o.owner.clone(), o.amount)); } } } st.delete_block(h2).map_err(|e| OrchestratorError::StorageFailed { operation: "del".into(), detail: format!("{:?}", e) })?; } }
         if let Ok(Some(g)) = st.load_block(0) { let mut tv = Validator::new(b"aevum_genesis_seed"); let mut g = g; if tv.validate_and_apply(&mut g).is_ok() { val.load_utxo_set(tv.utxo_set().clone()); } val.set_last_block(g.block_hash, 0, g.poh_tick_end); }
         for (miner, amt) in &rewards { if let Ok(u) = JtUtxo::new_global_clean(miner.clone(), *amt, &[1u8; 32], &[1u8; 32], our + 1, 0, Hash::zero()) { val.utxo_set_mut().add(u); } }
+        // Сохраняем возвраты в Storage чтобы не терялись при перезапуске
+        let utxo_set = val.utxo_set().clone();
+        st.save_utxo_set(&utxo_set).map_err(|e| OrchestratorError::StorageFailed { operation: "save_utxo".into(), detail: format!("{:?}", e) })?;
         self.metrics.total_refunded += refund; self.metrics.switches_performed += 1; self.processed_height = 0;
         self.wal.log(st, "fork_done", 0, None)?;
         Ok(())

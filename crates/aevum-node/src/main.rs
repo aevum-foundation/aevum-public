@@ -135,15 +135,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let replication = Arc::new(StdMutex::new(EncryptedReplication::new(Some(our_key.clone()), 1000)));
     let orchestrator = Arc::new(StdMutex::new(ChainOrchestrator::recover(&storage.lock().unwrap())));
 
-    // Синхронизируем Validator с восстановленной высотой оркестратора
+    // ВАЖНО: Оркестратор обрабатывает все смигрированные блоки при старте
     {
-        let orch = orchestrator.lock().unwrap();
+        let mut orch = orchestrator.lock().unwrap();
         let mut val = validator.lock().unwrap();
-        if orch.processed_height > val.last_block_height() {
-            if let Ok(Some(last_block)) = storage.lock().unwrap().load_genesis_block(orch.processed_height) {
-                val.set_last_block(last_block.block_hash, last_block.height, last_block.poh_tick_end);
-                val.genesis_applied = true;
-                tracing::info!("[MAIN] Validator synced to orchestrator height {}", orch.processed_height);
+        let mut st = storage.lock().unwrap();
+        if orch.processed_height < val.last_block_height() {
+            tracing::info!("[MAIN] Orchestrator processing migrated blocks: {}-{}", orch.processed_height + 1, val.last_block_height());
+            if let Err(e) = orch.process_chain(&mut val, &mut st, &sync_ctx_of(&validator, &storage, &chain_sync, &block_buffer, &dht, &replication, &orchestrator), &peers) {
+                tracing::warn!("[MAIN] Orchestrator initial processing error: {}", e);
             }
         }
     }
@@ -311,4 +311,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     while !shutdown.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_secs(1)); }
     tracing::info!("Shutting down...");
     Ok(())
+}
+
+// Временный SyncContext для инициализации оркестратора
+fn sync_ctx_of(
+    validator: &Arc<StdMutex<Validator>>, storage: &Arc<StdMutex<Storage>>,
+    chain_sync: &Arc<StdMutex<ChainSync>>, block_buffer: &Arc<StdMutex<BTreeMap<u64, Vec<u8>>>>,
+    dht: &Arc<StdMutex<aevum_node::p2p::dht::Dht>>,
+    replication: &Arc<StdMutex<EncryptedReplication>>,
+    orchestrator: &Arc<StdMutex<ChainOrchestrator>>,
+) -> SyncContext {
+    SyncContext {
+        validator: validator.clone(), storage: storage.clone(),
+        chain_sync: chain_sync.clone(), block_buffer: block_buffer.clone(),
+        replication: Some(replication.clone()), dht: dht.clone(),
+        orchestrator: orchestrator.clone(),
+    }
 }
