@@ -8,12 +8,8 @@ use aevum::crypto::keys::PrivateKey;
 use aevum_node::mempool::Mempool;
 use aevum_node::storage::Storage;
 use aevum_node::sync::ChainSync;
-use aevum_node::science_api::{ScienceTaskRequest, parse_science_task, estimate_task};
-use aevum_node::task_market::TaskMarket;
-use aevum_node::task_pool::TaskPool;
 use aevum_node::p2p::peers::PeersManager;
 use aevum_node::p2p::sync::{AtpMessage, SyncContext, create_status, handle_atp_message};
-use aevum_node::p2p::gossip::GossipManager;
 use aevum_node::p2p::noise::{AtpCipher, TofuStore};
 use aevum_node::p2p::connection::AtpConnection;
 use aevum_node::p2p::pex::PeerExchange;
@@ -24,7 +20,6 @@ use aevum_node::encrypted_replication::EncryptedReplication;
 use aevum_node::p2p::chain_orchestrator::ChainOrchestrator;
 use clap::Parser;
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -76,8 +71,6 @@ fn cors_response(body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
-    let start_time = Instant::now();
-
     let our_key = load_miner_key(&cli)?.unwrap_or_else(|| PrivateKey::generate());
     let miner_pubkey = our_key.public_key();
 
@@ -135,25 +128,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let replication = Arc::new(StdMutex::new(EncryptedReplication::new(Some(our_key.clone()), 1000)));
     let orchestrator = Arc::new(StdMutex::new(ChainOrchestrator::recover(&storage.lock().unwrap())));
 
-    // ВАЖНО: Оркестратор обрабатывает все смигрированные блоки при старте
-    {
-        let mut orch = orchestrator.lock().unwrap();
-        let mut val = validator.lock().unwrap();
-        let mut st = storage.lock().unwrap();
-        if orch.processed_height < val.last_block_height() {
-            tracing::info!("[MAIN] Orchestrator processing migrated blocks: {}-{}", orch.processed_height + 1, val.last_block_height());
-            if let Err(e) = orch.process_chain(&mut val, &mut st, &sync_ctx_of(&validator, &storage, &chain_sync, &block_buffer, &dht, &replication, &orchestrator), &peers) {
-                tracing::warn!("[MAIN] Orchestrator initial processing error: {}", e);
-            }
-        }
-    }
-
     let sync_ctx = Arc::new(SyncContext {
         validator: validator.clone(), storage: storage.clone(),
         chain_sync: chain_sync.clone(), block_buffer: block_buffer.clone(),
         replication: Some(replication.clone()), dht: dht.clone(),
         orchestrator: orchestrator.clone(),
     });
+
+    // Оркестратор при старте
+    {
+        let mut orch = orchestrator.lock().unwrap();
+        let mut val = validator.lock().unwrap();
+        let mut st = storage.lock().unwrap();
+        if orch.processed_height < val.last_block_height() {
+            tracing::info!("[MAIN] Orchestrator processing {}-{}", orch.processed_height + 1, val.last_block_height());
+            let tmp_ctx = SyncContext {
+                validator: validator.clone(), storage: storage.clone(),
+                chain_sync: chain_sync.clone(), block_buffer: block_buffer.clone(),
+                replication: Some(replication.clone()), dht: dht.clone(),
+                orchestrator: orchestrator.clone(),
+            };
+            let _ = orch.process_chain(&mut val, &mut st, &tmp_ctx, &peers);
+        }
+    }
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_ctrl = shutdown.clone();
@@ -180,7 +177,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if retry > 0 { tokio::time::sleep(Duration::from_secs(5 * (retry + 1) as u64)).await; }
                                 match aevum_node::p2p::peers::dial_peer(addr, dk.clone(), &dt).await {
                                     Ok((cipher, peer_id, reader, writer)) => {
-                                        tracing::info!("[ATP] ✅ CONNECTED to {}", hex::encode(&peer_id));
+                                        tracing::info!("[ATP] CONNECTED to {}", hex::encode(&peer_id));
                                         let conn = AtpConnection::new(cipher, peer_id, addr, dp.clone(), dc.clone(), false);
                                         let conn_handle = tokio::spawn(async move { conn.run(reader, writer).await; });
                                         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -202,7 +199,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tokio::spawn(async move {
                             match aevum_node::p2p::peers::accept_connection(stream, kc, &tc).await {
                                 Ok((cipher, peer_id, remote_addr, reader, writer)) => {
-                                    tracing::info!("[ATP] ✅ Accepted from {}", hex::encode(&peer_id));
+                                    tracing::info!("[ATP] Accepted from {}", hex::encode(&peer_id));
                                     AtpConnection::new(cipher, peer_id, remote_addr, pc, cc, true).run(reader, writer).await;
                                 }
                                 Err(e) => tracing::warn!("Accept failed: {}", e),
@@ -219,7 +216,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // HTTP
     let http_port = cli.http_port;
     let mempool_http = mempool.clone(); let validator_http = validator.clone(); let peers_http = peers.clone();
-    let shutdown_http = shutdown.clone(); let start_time_http = start_time;
+    let shutdown_http = shutdown.clone(); let start_time = Instant::now();
     std::thread::spawn(move || {
         let addr = format!("0.0.0.0:{}", http_port);
         let server = match tiny_http::Server::http(&addr) { Ok(s) => s, Err(e) => { tracing::error!("HTTP: {}", e); return; } };
@@ -229,12 +226,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match (request.url(), request.method()) {
                     ("/health", _) => { request.respond(cors_response("{\"status\":\"ok\"}")).ok(); }
                     ("/status", _) => {
-                        let (height, utxos, poh_tick, supply, uptime) = {
-                            let val = validator_http.lock().unwrap();
-                            (val.last_block_height(), val.utxo_set().len(), val.poh().current_tick_number(), val.utxo_set().total_supply(), start_time_http.elapsed().as_secs())
-                        };
-                        let pc = peers_http.peer_count(); let ms = mempool_http.lock().unwrap().len();
-                        let s = format!("{{\"height\":{},\"peers\":{},\"mempool\":{},\"utxos\":{},\"poh_tick\":{},\"supply\":{},\"uptime_sec\":{}}}", height, pc, ms, utxos, poh_tick, supply, uptime);
+                        let val = validator_http.lock().unwrap();
+                        let s = format!("{{\"height\":{},\"peers\":{},\"mempool\":{},\"utxos\":{},\"poh_tick\":{},\"supply\":{},\"uptime_sec\":{}}}",
+                            val.last_block_height(), peers_http.peer_count(), mempool_http.lock().unwrap().len(),
+                            val.utxo_set().len(), val.poh().current_tick_number(), val.utxo_set().total_supply(),
+                            start_time.elapsed().as_secs());
                         request.respond(cors_response(&s)).ok();
                     }
                     ("/tx", &Method::Post) => {
@@ -248,45 +244,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // МАЙНИНГ
+    // МАЙНИНГ — исправлен двойной захват мьютекса
     if let Some(mk) = load_miner_key(&cli)? {
         let vm = validator.clone(); let mm = mempool.clone(); let sm = storage.clone();
         let dam = developer_address; let sc = serial_counter.clone(); let shm = shutdown.clone(); let pm = peers.clone(); let s_m = sync_ctx.clone();
         std::thread::spawn(move || {
-            tracing::info!("⛏️  Mining thread started");
+            tracing::info!("Mining thread started");
             while !shm.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_secs(1));
-                let (tick_result, txs_backup, height, poh) = {
-                    let mut val = vm.lock().unwrap(); let mut mem = mm.lock().unwrap();
-                    val.tick_poh(); let poh = val.poh().current_tick_number();
-                    let active_miners = pm.peer_count().max(1) as u64;
-                    let target_ticks = 100u64.saturating_sub((active_miners / 10).min(80));
-                    if poh % target_ticks == 0 || !mem.is_empty() { (true, mem.take_batch(100), val.last_block_height() + 1, poh) }
-                    else { (false, vec![], 0, poh) }
-                };
-                if tick_result {
+                
+                // ОДИН захват val и mem
+                let mut val = vm.lock().unwrap();
+                let mut mem = mm.lock().unwrap();
+                val.tick_poh();
+                let poh = val.poh().current_tick_number();
+                let active_miners = pm.peer_count().max(1) as u64;
+                let target_ticks = 100u64.saturating_sub((active_miners / 10).min(80));
+                
+                let should_mine = poh % target_ticks == 0 || !mem.is_empty();
+                let txs_backup = if should_mine { mem.take_batch(100) } else { vec![] };
+                let height = val.last_block_height() + 1;
+                drop(mem);
+                drop(val);
+                
+                if should_mine {
+                    let mut val = vm.lock().unwrap();
+                    let mut st = sm.lock().unwrap();
                     let mut txs = txs_backup.clone();
-                    let mut val = vm.lock().unwrap(); let mut st = sm.lock().unwrap();
-                    let total_fees: u64 = txs.iter().map(|tx| { let a: u64 = tx.outputs.iter().map(|o| o.amount).sum(); if a > 0 { Economics::calculate_fee(a).0 } else { 0 } }).sum();
-                    let mut serial = sc.lock().unwrap(); *serial += 2;
+                    
+                    let total_fees: u64 = txs.iter().map(|tx| {
+                        let a: u64 = tx.outputs.iter().map(|o| o.amount).sum();
+                        if a > 0 { Economics::calculate_fee(a).0 } else { 0 }
+                    }).sum();
+                    
+                    let mut serial = sc.lock().unwrap();
+                    *serial += 2;
                     let coinbase = Economics::create_coinbase(&mk.public_key(), height, total_fees, &dam, *serial, poh);
+                    drop(serial);
+                    
                     txs.insert(0, coinbase);
-                    let mut block = Block::new(val.last_block_hash(), height, poh, poh + TICKS_PER_BLOCK, txs, val.utxo_set().get_state_root(), val.utxo_set().total_supply() + Economics::block_reward_satoshi(height) + total_fees, None);
+                    let mut block = Block::new(val.last_block_hash(), height, poh, poh + TICKS_PER_BLOCK, txs,
+                        val.utxo_set().get_state_root(),
+                        val.utxo_set().total_supply() + Economics::block_reward_satoshi(height) + total_fees, None);
+                    
                     if val.validate_and_apply(&mut block).is_ok() {
                         st.save_genesis_block(&block).ok();
-                        if let Err(e) = st.save_utxo_set(val.utxo_set()) { tracing::error!("Failed to save UTXO: {}", e); }
+                        st.save_utxo_set(val.utxo_set()).ok();
                         let _ = bincode::serialize(&val.poh_snapshot()).ok().and_then(|s| st.save_metadata(POH_SNAPSHOT_KEY, &s).ok());
-                        let _ = bincode::serialize(&*serial).ok().and_then(|s| st.save_metadata(SERIAL_COUNTER_KEY, &s).ok());
-                        if height % 1000 == 0 { let _ = SnapshotManager::save_if_needed(&sm, height, val.utxo_set()); }
-                        tracing::info!("⛏️  Mined block at height {}", height);
-                        drop(val); drop(st); drop(serial);
+                        tracing::info!("Mined block at height {}", height);
+                        
+                        drop(val); drop(st);
+                        
                         if let Ok(mut orch) = s_m.orchestrator.lock() {
-                            let mut v = vm.lock().unwrap(); let mut s = sm.lock().unwrap();
+                            let mut v = vm.lock().unwrap();
+                            let mut s = sm.lock().unwrap();
                             let _ = orch.process_chain(&mut v, &mut s, &s_m, &pm);
                         }
+                        
                         let status = create_status(&s_m);
                         if let Ok(data) = bincode::serialize(&status) { pm.broadcast(data); }
                     } else {
+                        drop(val); drop(st);
                         let mut mem = mm.lock().unwrap();
                         for tx in txs_backup { mem.insert(tx).ok(); }
                     }
@@ -301,30 +319,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         while !shutdown_hb.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_secs(30));
             let h = hb_ctx.validator.lock().unwrap().last_block_height();
-            tracing::info!("❤️ Heartbeat: height={}, peers={}", h, hb_peers.peer_count());
+            tracing::info!("Heartbeat: height={}, peers={}", h, hb_peers.peer_count());
             let status = create_status(&hb_ctx);
             if let Ok(data) = bincode::serialize(&status) { hb_peers.broadcast(data); }
         }
     });
 
-    tracing::info!("🚀 Aevum Node v0.4.0 — Sled Storage");
+    tracing::info!("Aevum Node v0.4.0 — Sled Storage");
     while !shutdown.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_secs(1)); }
-    tracing::info!("Shutting down...");
     Ok(())
-}
-
-// Временный SyncContext для инициализации оркестратора
-fn sync_ctx_of(
-    validator: &Arc<StdMutex<Validator>>, storage: &Arc<StdMutex<Storage>>,
-    chain_sync: &Arc<StdMutex<ChainSync>>, block_buffer: &Arc<StdMutex<BTreeMap<u64, Vec<u8>>>>,
-    dht: &Arc<StdMutex<aevum_node::p2p::dht::Dht>>,
-    replication: &Arc<StdMutex<EncryptedReplication>>,
-    orchestrator: &Arc<StdMutex<ChainOrchestrator>>,
-) -> SyncContext {
-    SyncContext {
-        validator: validator.clone(), storage: storage.clone(),
-        chain_sync: chain_sync.clone(), block_buffer: block_buffer.clone(),
-        replication: Some(replication.clone()), dht: dht.clone(),
-        orchestrator: orchestrator.clone(),
-    }
 }
