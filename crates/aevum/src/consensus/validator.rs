@@ -10,7 +10,7 @@ pub struct Validator {
     poh: Poh,
     last_block_hash: Hash,
     last_block_height: u64,
-    last_poh_tick_end: u64,
+    pub last_poh_tick_end: u64,
     pub genesis_applied: bool,
 }
 
@@ -102,7 +102,7 @@ impl Validator {
     pub fn utxo_set_mut(&mut self) -> &mut UtxoSet { &mut self.utxo_set }
     pub fn load_utxo_set(&mut self, utxo_set: UtxoSet) { self.utxo_set = utxo_set; }
     pub fn set_last_block(&mut self, hash: Hash, height: u64, poh_tick: u64) {
-        self.last_block_hash = hash; self.last_block_height = height; self.last_poh_tick_end = poh_tick;
+        self.last_block_hash = hash; self.last_block_height = height; if poh_tick > self.last_poh_tick_end { self.last_poh_tick_end = poh_tick; }
     }
     pub fn tick_poh(&mut self) { self.poh.tick(); }
     pub fn restore_poh_from_snapshot(&mut self, snapshot: &super::poh::PohSnapshot) { self.poh = Poh::from_snapshot(snapshot); }

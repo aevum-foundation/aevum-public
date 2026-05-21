@@ -140,6 +140,7 @@ impl UtxoSet {
     // ============================================================
 
     pub fn apply_block(&mut self, block: &Block) -> Result<Hash, UtxoSetError> {
+        tracing::info!("[STATE] apply_block height={}", block.height);
         let mut spent: HashSet<&Hash> = HashSet::new();
         let mut cb_cnt = 0u32;
         let mut cached_inputs: Vec<Vec<JtUtxo>> = Vec::new();
@@ -217,6 +218,7 @@ impl UtxoSet {
         }
 
         self.total_supply = block.total_supply;
+        tracing::info!("[STATE] total_supply set to {}", self.total_supply);
         self.recompute_root();
         Ok(self.state_root)
     }
