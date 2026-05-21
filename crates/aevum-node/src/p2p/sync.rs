@@ -39,6 +39,7 @@ pub struct SyncContext {
     pub block_buffer: Arc<StdMutex<BTreeMap<u64, Vec<u8>>>>,
     pub dht: Arc<StdMutex<crate::p2p::dht::Dht>>,
     pub replication: Option<Arc<StdMutex<crate::encrypted_replication::EncryptedReplication>>>,
+    pub orchestrator: Arc<StdMutex<crate::p2p::chain_orchestrator::ChainOrchestrator>>,
 }
 
 pub fn create_status(ctx: &SyncContext) -> AtpMessage {
@@ -54,16 +55,23 @@ pub fn create_status(ctx: &SyncContext) -> AtpMessage {
 }
 
 pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8; 20], peers: &Arc<PeersManager>) {
+    tracing::info!("[SYNC] handle_msg: {:?}", std::mem::discriminant(&msg));
     match msg {
         AtpMessage::Status { height, .. } => {
             let my = ctx.validator.lock().unwrap().last_block_height();
+            tracing::info!("[SYNC] Status: peer={}, my={}", height, my);
             if height > my {
                 let from = if my == 0 { 1 } else { my + 1 };
+                tracing::info!("[SYNC] Requesting headers {}-{}", from, height);
                 let req = AtpMessage::HeaderRequest { from, to: height };
-                if let Ok(data) = bincode::serialize(&req) { peers.send_to(peer_id, data); }
+                if let Ok(data) = bincode::serialize(&req) { 
+                    let sent = peers.send_to(peer_id, data);
+                    tracing::info!("[SYNC] HeaderRequest sent={}", sent);
+                }
             }
         }
         AtpMessage::HeaderRequest { from, to } => {
+            tracing::info!("[SYNC] HeaderRequest {}-{}", from, to);
             let st = ctx.storage.lock().unwrap();
             let mut headers = Vec::new();
             for h in from..=to {
@@ -76,18 +84,22 @@ pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8
                     });
                 }
             }
+            tracing::info!("[SYNC] Sending {} headers", headers.len());
             let resp = AtpMessage::HeaderResponse { headers };
             if let Ok(data) = bincode::serialize(&resp) { peers.send_to(peer_id, data); }
         }
         AtpMessage::HeaderResponse { headers } => {
+            tracing::info!("[SYNC] HeaderResponse: {} headers", headers.len());
             if !headers.is_empty() {
-                let from = headers.iter().map(|h| h.height).min().unwrap();
+                let from = ctx.validator.lock().unwrap().last_block_height() + 1;
                 let to = headers.iter().map(|h| h.height).max().unwrap();
+                tracing::info!("[SYNC] Requesting blocks {}-{}", from, to);
                 let req = AtpMessage::BlockRequest { request_id: rand::random(), from, to };
                 if let Ok(data) = bincode::serialize(&req) { peers.send_to(peer_id, data); }
             }
         }
         AtpMessage::BlockRequest { request_id, from, to } => {
+            tracing::info!("[SYNC] BlockRequest {}-{}", from, to);
             let st = ctx.storage.lock().unwrap();
             let mut blocks = Vec::new();
             for h in from..=to {
@@ -95,17 +107,20 @@ pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8
                     if let Ok(bytes) = bincode::serialize(&block) { blocks.push((h, bytes)); }
                 }
             }
+            tracing::info!("[SYNC] Sending {} blocks", blocks.len());
             let resp = AtpMessage::BlockResponse { request_id, blocks };
             if let Ok(data) = bincode::serialize(&resp) { peers.send_to(peer_id, data); }
         }
         AtpMessage::BlockResponse { blocks, .. } => {
+            tracing::info!("[SYNC] BlockResponse: {} blocks", blocks.len());
             let mut buffer = ctx.block_buffer.lock().unwrap();
             for (height, bytes) in blocks { buffer.insert(height, bytes); }
             drop(buffer);
-            flush_block_buffer_with_rollback(ctx, peer_id, peers);
+            flush_block_buffer(ctx);
         }
         AtpMessage::Ping { nonce } => {
-            if let Ok(data) = bincode::serialize(&AtpMessage::Pong { nonce }) { peers.send_to(peer_id, data); }
+            let pong = AtpMessage::Pong { nonce };
+            if let Ok(data) = bincode::serialize(&pong) { peers.send_to(peer_id, data); }
         }
         AtpMessage::GetPeers { count } => {
             let msg = crate::p2p::pex::PeerExchange::create_peer_list(peers, count as usize);
@@ -119,7 +134,8 @@ pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8
     }
 }
 
-fn flush_block_buffer_with_rollback(ctx: &SyncContext, peer_id: &[u8; 20], peers: &Arc<PeersManager>) {
+fn flush_block_buffer(ctx: &SyncContext) {
+    tracing::info!("[SYNC] flush_block_buffer START");
     let mut val = ctx.validator.lock().unwrap();
     let mut st = ctx.storage.lock().unwrap();
     let mut buffer = ctx.block_buffer.lock().unwrap();
@@ -130,8 +146,7 @@ fn flush_block_buffer_with_rollback(ctx: &SyncContext, peer_id: &[u8; 20], peers
         let next = val.last_block_height() + 1;
         if let Some(block_bytes) = buffer.remove(&next) {
             let block: Block = match bincode::deserialize(&block_bytes) {
-                Ok(b) => b,
-                Err(_) => continue,
+                Ok(b) => b, Err(_) => continue,
             };
             let height = block.height;
             match val.validate_and_apply(&mut block.clone()) {
@@ -140,43 +155,29 @@ fn flush_block_buffer_with_rollback(ctx: &SyncContext, peer_id: &[u8; 20], peers
                     st.save_utxo_set(val.utxo_set()).ok();
                     ctx.chain_sync.lock().unwrap().mark_received(height);
                     applied += 1;
+                    tracing::info!("[SYNC] Block {} applied", height);
                 }
                 Err(e) => {
                     let err_str = format!("{:?}", e);
-                    if err_str.contains("prev_hash") {
-                        // Откатываемся до общего предка
-                        if let Err(re) = rollback_to_height(&mut val, &mut st, height.saturating_sub(1)) {
-                            tracing::warn!("[SYNC] Rollback failed: {}", re);
-                        }
-                        // Пропускаем этот блок — попробуем следующий
-                        continue;
-                    }
-                    // Другие ошибки — останавливаем
+                    tracing::warn!("[SYNC] Block {} failed: {:?}", height, e);
                     break;
                 }
             }
-        } else {
-            break;
-        }
+        } else { break; }
     }
 
     if applied > 0 {
         tracing::info!("[SYNC] Applied {} blocks, height: {} → {}", applied, our_before, val.last_block_height());
+        tracing::info!("[SYNC] Calling orchestrator...");
+        match ctx.orchestrator.lock() {
+            Ok(mut orch) => {
+                tracing::info!("[SYNC] Orchestrator locked, calling process_chain");
+                match orch.process_chain(&mut val, &mut st, ctx, &Arc::new(PeersManager::new(aevum::crypto::keys::PrivateKey::generate()))) {
+                    Ok(n) => tracing::info!("[SYNC] Orchestrator processed {} blocks", n),
+                    Err(e) => tracing::warn!("[SYNC] Orchestrator error: {}", e),
+                }
+            }
+            Err(e) => tracing::error!("[SYNC] Orchestrator lock FAILED: {:?}", e),
+        }
     }
-}
-
-fn rollback_to_height(val: &mut Validator, st: &mut Storage, target: u64) -> Result<(), String> {
-    let current = val.last_block_height();
-    if current <= target { return Ok(()); }
-    for h in (target + 1..=current).rev() {
-        st.delete_block(h).map_err(|e| format!("delete {}: {}", h, e))?;
-    }
-    if target == 0 {
-        let genesis = st.load_block(0).map_err(|e| format!("genesis: {:?}", e))?.ok_or("no genesis")?;
-        val.set_last_block(genesis.block_hash, 0, genesis.poh_tick_end);
-    } else {
-        let base = st.load_block(target).map_err(|e| format!("base: {:?}", e))?.ok_or("no base")?;
-        val.set_last_block(base.block_hash, base.height, base.poh_tick_end);
-    }
-    Ok(())
 }

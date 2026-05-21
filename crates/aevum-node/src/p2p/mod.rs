@@ -40,17 +40,22 @@ pub enum P2pCommand {
 impl P2pNode {
     pub async fn new(listen_addr: &str, bootstrap_peers: Vec<String>, context: Arc<NodeContext>) -> Result<(Self, P2pHandle), Box<dyn std::error::Error>> {
         let (cmd_tx, _) = crossbeam::channel::unbounded();
-        let node = P2pNode { connected_peers: Arc::new(StdMutex::new(HashSet::new())), bootstrap_peers, listen_addr: listen_addr.to_string(), context };
+        let node = P2pNode {
+            connected_peers: Arc::new(StdMutex::new(HashSet::new())),
+            bootstrap_peers,
+            listen_addr: listen_addr.to_string(),
+            context,
+        };
         let handle = P2pHandle { sender: cmd_tx };
         Ok((node, handle))
     }
 
     pub fn start(self) -> P2pHandle {
-        // ATP запуск через отдельные модули
         let (cmd_tx, _) = crossbeam::channel::unbounded();
         P2pHandle { sender: cmd_tx }
     }
 }
+
 pub mod connection;
 pub mod dht;
 pub mod peer_score;
@@ -58,3 +63,4 @@ pub mod addr_manager;
 pub mod snapshots;
 pub use noise::AtpCipher as NoiseCipher;
 pub mod pex;
+pub mod chain_orchestrator;

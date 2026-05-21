@@ -118,7 +118,7 @@ pub fn parse_science_task(
 
     // 9. rate limiting
     {
-        let st = storage.lock().map_err(|e| format!("Storage lock: {}", e))?;
+        let mut st = storage.lock().map_err(|e| format!("Storage lock: {}", e))?;
         let rate_key = format!("last_task_time_{}", hex::encode(&customer_key));
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let last_time: u64 = st.load_metadata(&rate_key)

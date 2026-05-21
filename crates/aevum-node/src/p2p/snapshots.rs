@@ -21,7 +21,7 @@ impl SnapshotManager {
         let key = format!("{}{}", SNAPSHOT_KEY_PREFIX, height);
         let data = bincode::serialize(utxo_set).map_err(|e| format!("serialize: {}", e))?;
 
-        let st = storage.lock().unwrap();
+        let mut st = storage.lock().unwrap();
         st.save_metadata(&key, &data).map_err(|e| format!("save: {}", e))?;
 
         tracing::info!("💾 UTXO snapshot saved at height {}", height);
@@ -38,7 +38,7 @@ impl SnapshotManager {
         let mut h = start;
         loop {
             let key = format!("{}{}", SNAPSHOT_KEY_PREFIX, h);
-            let st = storage.lock().unwrap();
+            let mut st = storage.lock().unwrap();
             if let Ok(Some(data)) = st.load_metadata(&key) {
                 let utxo_set: UtxoSet = bincode::deserialize(&data).map_err(|e| format!("deserialize: {}", e))?;
                 tracing::info!("📥 UTXO snapshot loaded from height {}", h);
@@ -67,7 +67,7 @@ impl SnapshotManager {
 
         while h < keep_height {
             let key = format!("{}{}", SNAPSHOT_KEY_PREFIX, h);
-            let st = storage.lock().unwrap();
+            let mut st = storage.lock().unwrap();
             if st.load_metadata(&key).ok().flatten().is_some() {
                 (*st).delete_metadata(&key).map_err(|e| format!("delete: {}", e))?;
                 removed += 1;

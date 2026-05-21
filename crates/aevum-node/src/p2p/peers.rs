@@ -54,12 +54,15 @@ impl PeersManager {
     }
 
     pub fn register_peer(&self, peer_id: [u8; 20], addr: SocketAddr, tx: mpsc::Sender<Vec<u8>>) {
+        tracing::info!("[PEERS] register_peer: {}", hex::encode(&peer_id));
         self.peers.insert(peer_id, PeerState { tx, addr, msg_count: 0, last_reset: Instant::now() });
         self.peer_ips.insert(peer_id, addr);
         *self.ip_connections.entry(addr).or_insert(0) += 1;
+        tracing::info!("[PEERS] total peers after register: {}", self.peers.len());
     }
 
     pub fn remove_peer(&self, peer_id: &[u8; 20]) {
+        tracing::info!("[PEERS] remove_peer: {}", hex::encode(peer_id));
         if let Some((_, s)) = self.peers.remove(peer_id) {
             if let Some(mut c) = self.ip_connections.get_mut(&s.addr) { *c = c.saturating_sub(1); }
         }
@@ -81,11 +84,24 @@ impl PeersManager {
     }
 
     pub fn send_to(&self, peer_id: &[u8; 20], msg: Vec<u8>) -> bool {
-        if let Some(mut s) = self.peers.get_mut(peer_id) {
-            if s.last_reset.elapsed() >= Duration::from_secs(1) { s.msg_count = 0; s.last_reset = Instant::now(); }
-            if s.msg_count >= RATE_LIMIT_PER_SEC { return false; }
-            s.msg_count += 1; s.tx.try_send(msg).is_ok()
-        } else { false }
+        tracing::info!("[PEERS] send_to: {} ({} bytes)", hex::encode(peer_id), msg.len());
+        match self.peers.get_mut(peer_id) {
+            Some(mut s) => {
+                if s.last_reset.elapsed() >= Duration::from_secs(1) { s.msg_count = 0; s.last_reset = Instant::now(); }
+                if s.msg_count >= RATE_LIMIT_PER_SEC {
+                    tracing::warn!("[PEERS] send_to: rate limited");
+                    return false;
+                }
+                s.msg_count += 1;
+                let result = s.tx.try_send(msg).is_ok();
+                tracing::info!("[PEERS] send_to: try_send={}", result);
+                result
+            }
+            None => {
+                tracing::warn!("[PEERS] send_to: peer {} NOT FOUND", hex::encode(peer_id));
+                false
+            }
+        }
     }
 
     pub fn broadcast(&self, msg: Vec<u8>) {
@@ -93,7 +109,6 @@ impl PeersManager {
     }
 }
 
-/// Сервер: шаг 2 XX handshake
 pub async fn accept_connection(
     stream: TcpStream, our_key: PrivateKey, tofu: &std::sync::Mutex<TofuStore>,
 ) -> Result<(AtpCipher, [u8; 20], SocketAddr, ReadHalf<TcpStream>, WriteHalf<TcpStream>), String> {
@@ -119,7 +134,6 @@ pub async fn accept_connection(
     Ok((cipher, peer_id, addr, reader, writer))
 }
 
-/// Клиент: шаг 1 + шаг 3 XX handshake
 pub async fn dial_peer(
     addr: SocketAddr, our_key: PrivateKey, _tofu: &std::sync::Mutex<TofuStore>,
 ) -> Result<(AtpCipher, [u8; 20], ReadHalf<TcpStream>, WriteHalf<TcpStream>), String> {

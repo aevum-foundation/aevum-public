@@ -21,6 +21,7 @@ use aevum_node::p2p::peer_score::PeerScoring;
 use aevum_node::p2p::addr_manager::AddrManager;
 use aevum_node::p2p::snapshots::SnapshotManager;
 use aevum_node::encrypted_replication::EncryptedReplication;
+use aevum_node::p2p::chain_orchestrator::ChainOrchestrator;
 use clap::Parser;
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -37,7 +38,7 @@ const SERIAL_COUNTER_KEY: &str = "serial_counter";
 const TICKS_PER_BLOCK: u64 = 100;
 
 #[derive(Parser)]
-#[command(name = "aevum-node", version = "0.3.0")]
+#[command(name = "aevum-node", version = "0.4.0")]
 struct Cli {
     #[arg(long, default_value = "0.0.0.0:9733")] listen_addr: String,
     #[arg(long, default_value = "")] bootstrap_peers: String,
@@ -77,19 +78,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let start_time = Instant::now();
 
-    let storage = Arc::new(StdMutex::new(Storage::open(&cli.db_path)?));
+    let our_key = load_miner_key(&cli)?.unwrap_or_else(|| PrivateKey::generate());
+    let miner_pubkey = our_key.public_key();
+
+    let storage = Arc::new(StdMutex::new(
+        Storage::open(&cli.db_path)?.with_encryption(&miner_pubkey.to_bytes())
+    ));
+
     {
         let mut st = storage.lock().unwrap();
-        if st.max_height()?.is_none() && cli.genesis_file.exists() {
+        if st.max_genesis_height()?.is_none() && cli.genesis_file.exists() {
             let data = std::fs::read_to_string(&cli.genesis_file)?;
             let mut block: Block = serde_json::from_str(&data)?;
             block.block_hash = block.compute_hash();
-            st.save_block(&block)?;
-            tracing::info!("Genesis loaded");
+            st.save_genesis_block(&block)?;
+            tracing::info!("Genesis loaded into storage");
         }
     }
 
-    let max_height = storage.lock().unwrap().max_height()?.unwrap_or(0);
+    let max_height = storage.lock().unwrap().max_genesis_height()?.unwrap_or(0);
     tracing::info!("Height: {}", max_height);
 
     let serial_counter: u64 = storage.lock().unwrap().load_metadata(SERIAL_COUNTER_KEY).ok().flatten()
@@ -101,73 +108,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(snap) = bincode::deserialize::<PohSnapshot>(&snap) { validator.restore_poh_from_snapshot(&snap); }
     }
     let utxo_set = storage.lock().unwrap().load_utxo_set().unwrap_or_else(|_| UtxoSet::new());
-    // Пробуем загрузить снапшот если UTXO пуст
-    if utxo_set.is_empty() {
-        if let Ok(Some((snap_height, snap_utxo))) = SnapshotManager::load_nearest(&storage, max_height) {
-            tracing::info!("Loaded UTXO snapshot from height {}, applying...", snap_height);
-            validator.load_utxo_set(snap_utxo);
-            validator.genesis_applied = true;
-        }
-    }
     if !utxo_set.is_empty() {
         validator.load_utxo_set(utxo_set);
         validator.genesis_applied = true;
-        if let Some(lb) = storage.lock().unwrap().load_block(max_height)? { validator.set_last_block(lb.block_hash, lb.height, lb.poh_tick_end); }
-    } else if let Some(gb) = storage.lock().unwrap().load_block(0)? { let mut gb = gb; validator.validate_and_apply(&mut gb)?; }
+        if let Some(lb) = storage.lock().unwrap().load_genesis_block(max_height)? {
+            validator.set_last_block(lb.block_hash, lb.height, lb.poh_tick_end);
+        }
+    } else if let Some(gb) = storage.lock().unwrap().load_genesis_block(0)? {
+        let mut gb = gb; validator.validate_and_apply(&mut gb)?;
+    }
 
     let validator = Arc::new(StdMutex::new(validator));
     let mempool = Arc::new(StdMutex::new(Mempool::new(10_000)));
     let chain_sync = Arc::new(StdMutex::new(ChainSync::new(100)));
     let block_buffer = Arc::new(StdMutex::new(BTreeMap::new()));
 
-    let miner_key = load_miner_key(&cli)?;
     let dev_addr_bytes = hex::decode(&cli.developer_address).expect("Invalid dev addr");
     let mut dev_bytes = [0u8; 32]; dev_bytes.copy_from_slice(&dev_addr_bytes[..32]);
     let developer_address = aevum::crypto::keys::PublicKey::from_bytes(dev_bytes).expect("Invalid dev key");
 
-    let our_key = miner_key.clone().unwrap_or_else(|| PrivateKey::generate());
     let peers = Arc::new(PeersManager::new(our_key.clone()));
-    let gossip = Arc::new(StdMutex::new(GossipManager::new()));
     let tofu = Arc::new(StdMutex::new(TofuStore::new()));
     let peer_scoring = Arc::new(StdMutex::new(PeerScoring::new()));
     let addr_manager = Arc::new(StdMutex::new(AddrManager::new(10000)));
+    let dht = Arc::new(StdMutex::new(aevum_node::p2p::dht::Dht::new(blake3::hash(&miner_pubkey.to_bytes()).into())));
+    let replication = Arc::new(StdMutex::new(EncryptedReplication::new(Some(our_key.clone()), 1000)));
+    let orchestrator = Arc::new(StdMutex::new(ChainOrchestrator::recover(&storage.lock().unwrap())));
 
-    let dht = Arc::new(StdMutex::new(aevum_node::p2p::dht::Dht::new(blake3::hash(&our_key.public_key().to_bytes()).into())));
-    let replication = Arc::new(StdMutex::new(EncryptedReplication::new(miner_key.clone(), 1000)));
+    // Синхронизируем Validator с восстановленной высотой оркестратора
+    {
+        let orch = orchestrator.lock().unwrap();
+        let mut val = validator.lock().unwrap();
+        if orch.processed_height > val.last_block_height() {
+            if let Ok(Some(last_block)) = storage.lock().unwrap().load_genesis_block(orch.processed_height) {
+                val.set_last_block(last_block.block_hash, last_block.height, last_block.poh_tick_end);
+                val.genesis_applied = true;
+                tracing::info!("[MAIN] Validator synced to orchestrator height {}", orch.processed_height);
+            }
+        }
+    }
+
     let sync_ctx = Arc::new(SyncContext {
-        validator: validator.clone(),
-        storage: storage.clone(),
-        chain_sync: chain_sync.clone(),
-        block_buffer: block_buffer.clone(),
-        replication: Some(replication.clone()),
-        dht: dht.clone(),
+        validator: validator.clone(), storage: storage.clone(),
+        chain_sync: chain_sync.clone(), block_buffer: block_buffer.clone(),
+        replication: Some(replication.clone()), dht: dht.clone(),
+        orchestrator: orchestrator.clone(),
     });
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_ctrl = shutdown.clone();
-    ctrlc::set_handler(move || {
-        tracing::info!("Ctrl+C received");
-        shutdown_ctrl.store(true, Ordering::SeqCst);
-    }).expect("Error setting Ctrl-C handler");
+    ctrlc::set_handler(move || { tracing::info!("Ctrl+C received"); shutdown_ctrl.store(true, Ordering::SeqCst); }).expect("Error setting Ctrl-C handler");
 
-    // ATP ПОТОК
+    // ATP
     let server_listen_addr = cli.listen_addr.clone();
-    let atp_peers = peers.clone();
-    let atp_ctx = sync_ctx.clone();
-    let atp_key = our_key.clone();
-    let atp_tofu = tofu.clone();
-    let atp_shutdown = shutdown.clone();
+    let atp_peers = peers.clone(); let atp_ctx = sync_ctx.clone(); let atp_key = our_key.clone(); let atp_tofu = tofu.clone(); let atp_shutdown = shutdown.clone();
     let bootstrap_peers: Vec<String> = if cli.bootstrap_peers.is_empty() { vec![] } else { cli.bootstrap_peers.split(',').map(|s| s.trim().to_string()).collect() };
 
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4).thread_name("aevum-atp").enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).thread_name("aevum-atp").enable_all().build().unwrap();
         rt.block_on(async move {
-            let listener = match TcpListener::bind(&server_listen_addr).await {
-                Ok(l) => l, Err(e) => { tracing::error!("Bind: {}", e); return; }
-            };
+            let listener = match TcpListener::bind(&server_listen_addr).await { Ok(l) => l, Err(e) => { tracing::error!("Bind: {}", e); return; } };
             tracing::info!("[ATP] Listening on {}", server_listen_addr);
-
             if !bootstrap_peers.is_empty() {
                 let dp = atp_peers.clone(); let dc = atp_ctx.clone(); let dk = atp_key.clone(); let dt = atp_tofu.clone(); let ds = atp_shutdown.clone();
                 tokio::spawn(async move {
@@ -181,14 +182,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     Ok((cipher, peer_id, reader, writer)) => {
                                         tracing::info!("[ATP] ✅ CONNECTED to {}", hex::encode(&peer_id));
                                         let conn = AtpConnection::new(cipher, peer_id, addr, dp.clone(), dc.clone(), false);
-                                        // Запускаем run() — синхронизация запустится автоматически после handshake
                                         let conn_handle = tokio::spawn(async move { conn.run(reader, writer).await; });
-                                        // Ждём немного чтобы run() создал каналы
                                         tokio::time::sleep(Duration::from_millis(100)).await;
-                                        // PEX: запрашиваем список пиров
                                         aevum_node::p2p::pex::PeerExchange::request_peers(&dp, &peer_id);
-                                        let _ = conn_handle.await;
-                                        break;
+                                        let _ = conn_handle.await; break;
                                     }
                                     Err(_) => {}
                                 }
@@ -197,7 +194,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 });
             }
-
             while !atp_shutdown.load(Ordering::SeqCst) {
                 match tokio::time::timeout(Duration::from_secs(1), listener.accept()).await {
                     Ok(Ok((stream, addr))) => {
@@ -253,11 +249,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // МАЙНИНГ
-    let mut mining_handle = None;
-    if let Some(mk) = miner_key {
+    if let Some(mk) = load_miner_key(&cli)? {
         let vm = validator.clone(); let mm = mempool.clone(); let sm = storage.clone();
         let dam = developer_address; let sc = serial_counter.clone(); let shm = shutdown.clone(); let pm = peers.clone(); let s_m = sync_ctx.clone();
-        let handle = std::thread::spawn(move || {
+        std::thread::spawn(move || {
             tracing::info!("⛏️  Mining thread started");
             while !shm.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_secs(1));
@@ -265,35 +260,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut val = vm.lock().unwrap(); let mut mem = mm.lock().unwrap();
                     val.tick_poh(); let poh = val.poh().current_tick_number();
                     let active_miners = pm.peer_count().max(1) as u64;
-                    let target_ticks = 100u64.saturating_sub((active_miners / 10).min(80)); // 30сек при 1 майнере, 6сек при 1000+
+                    let target_ticks = 100u64.saturating_sub((active_miners / 10).min(80));
                     if poh % target_ticks == 0 || !mem.is_empty() { (true, mem.take_batch(100), val.last_block_height() + 1, poh) }
                     else { (false, vec![], 0, poh) }
                 };
                 if tick_result {
                     let mut txs = txs_backup.clone();
                     let mut val = vm.lock().unwrap(); let mut st = sm.lock().unwrap();
-                    let total_fees: u64 = txs.iter().map(|tx| {
-                        let a: u64 = tx.outputs.iter().map(|o| o.amount).sum();
-                        if a > 0 { Economics::calculate_fee(a).0 } else { 0 }
-                    }).sum();
+                    let total_fees: u64 = txs.iter().map(|tx| { let a: u64 = tx.outputs.iter().map(|o| o.amount).sum(); if a > 0 { Economics::calculate_fee(a).0 } else { 0 } }).sum();
                     let mut serial = sc.lock().unwrap(); *serial += 2;
                     let coinbase = Economics::create_coinbase(&mk.public_key(), height, total_fees, &dam, *serial, poh);
                     txs.insert(0, coinbase);
                     let mut block = Block::new(val.last_block_hash(), height, poh, poh + TICKS_PER_BLOCK, txs, val.utxo_set().get_state_root(), val.utxo_set().total_supply() + Economics::block_reward_satoshi(height) + total_fees, None);
                     if val.validate_and_apply(&mut block).is_ok() {
-                        st.save_block(&block).ok(); if let Err(e) = st.save_utxo_set(val.utxo_set()) { tracing::error!("Failed to save UTXO: {}", e); }
+                        st.save_genesis_block(&block).ok();
+                        if let Err(e) = st.save_utxo_set(val.utxo_set()) { tracing::error!("Failed to save UTXO: {}", e); }
                         let _ = bincode::serialize(&val.poh_snapshot()).ok().and_then(|s| st.save_metadata(POH_SNAPSHOT_KEY, &s).ok());
                         let _ = bincode::serialize(&*serial).ok().and_then(|s| st.save_metadata(SERIAL_COUNTER_KEY, &s).ok());
                         if height % 1000 == 0 { let _ = SnapshotManager::save_if_needed(&sm, height, val.utxo_set()); }
-                        drop(val); drop(st); drop(serial);
                         tracing::info!("⛏️  Mined block at height {}", height);
+                        drop(val); drop(st); drop(serial);
+                        if let Ok(mut orch) = s_m.orchestrator.lock() {
+                            let mut v = vm.lock().unwrap(); let mut s = sm.lock().unwrap();
+                            let _ = orch.process_chain(&mut v, &mut s, &s_m, &pm);
+                        }
                         let status = create_status(&s_m);
                         if let Ok(data) = bincode::serialize(&status) { pm.broadcast(data); }
-                    } else { let mut mem = mm.lock().unwrap(); for tx in txs_backup { mem.insert(tx).ok(); } }
+                    } else {
+                        let mut mem = mm.lock().unwrap();
+                        for tx in txs_backup { mem.insert(tx).ok(); }
+                    }
                 }
             }
         });
-        mining_handle = Some(handle);
     }
 
     // Heartbeat
@@ -302,22 +301,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         while !shutdown_hb.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_secs(30));
             let h = hb_ctx.validator.lock().unwrap().last_block_height();
-            // DHT cleanup + refresh каждые 30 минут
-            if h % 60 == 0 {
-                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-                if let Some(ref dht) = hb_ctx.dht.lock().ok().as_deref() { } // placeholder
-            }
             tracing::info!("❤️ Heartbeat: height={}, peers={}", h, hb_peers.peer_count());
             let status = create_status(&hb_ctx);
             if let Ok(data) = bincode::serialize(&status) { hb_peers.broadcast(data); }
         }
     });
 
-    tracing::info!("🚀 Aevum Node v0.3.0 — ATP Protocol");
-
+    tracing::info!("🚀 Aevum Node v0.4.0 — Sled Storage");
     while !shutdown.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_secs(1)); }
-
     tracing::info!("Shutting down...");
-    if let Some(h) = mining_handle { h.join().ok(); }
     Ok(())
 }
