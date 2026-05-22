@@ -3,8 +3,10 @@ use aevum::consensus::validator::Validator;
 use aevum::core::block::Block;
 use aevum::core::economics::Economics;
 use aevum::core::state::UtxoSet;
-use aevum::core::transaction::Transaction;
+use aevum::core::transaction::{Transaction, TxOutput};
+use aevum::core::jt_utxo::JtUtxo;
 use aevum::crypto::keys::PrivateKey;
+use aevum::crypto::hash::Hash;
 use aevum_node::mempool::Mempool;
 use aevum_node::storage::Storage;
 use aevum_node::sync::ChainSync;
@@ -33,17 +35,37 @@ const POH_SNAPSHOT_KEY: &str = "poh_snapshot";
 const SERIAL_COUNTER_KEY: &str = "serial_counter";
 const TICKS_PER_BLOCK: u64 = 30;
 
+/// ВШИТЫЙ ГЕНЕЗИС — одинаковый для всех нод
+const GENESIS_ADDRESS: &str = "0ffc25780ab973a85612aad6f0b7abb35bd3fd2222387de0364fd522f79c36e3";
+const GENESIS_AMOUNT: u64 = 21_000_000 * 100_000_000; // 21M AEV в сатоши
+
+fn create_genesis_block() -> Block {
+    let addr_bytes = hex::decode(GENESIS_ADDRESS).expect("Invalid genesis address");
+    let mut pk_bytes = [0u8; 32];
+    pk_bytes.copy_from_slice(&addr_bytes[..32]);
+    let founder_key = aevum::crypto::keys::PublicKey::from_bytes(pk_bytes).expect("Invalid genesis key");
+    
+    let utxo = JtUtxo::new_global_clean(
+        founder_key, GENESIS_AMOUNT,
+        &[1u8; 32], &[1u8; 32],
+        0, 0, Hash::zero(),
+    ).expect("Genesis UTXO");
+    
+    let output = TxOutput::from_jt_utxo(&utxo, 0);
+    let tx = Transaction::new(vec![], vec![output], 0);
+    Block::genesis(vec![tx])
+}
+
 #[derive(Parser)]
-#[command(name = "aevum-node", version = "0.4.0")]
+#[command(name = "aevum-node", version = "0.5.0")]
 struct Cli {
     #[arg(long, default_value = "0.0.0.0:9733")] listen_addr: String,
     #[arg(long, default_value = "")] bootstrap_peers: String,
     #[arg(long, default_value = "./aevum.db")] db_path: PathBuf,
     #[arg(long)] miner_key: Option<String>,
     #[arg(long)] miner_key_file: Option<PathBuf>,
-    #[arg(long)] developer_address: String,
+    #[arg(long, default_value = "0ffc25780ab973a85612aad6f0b7abb35bd3fd2222387de0364fd522f79c36e3")] developer_address: String,
     #[arg(long, default_value = "19734")] http_port: u16,
-    #[arg(long, default_value = "genesis.json")] genesis_file: PathBuf,
 }
 
 fn load_miner_key(cli: &Cli) -> Result<Option<PrivateKey>, String> {
@@ -79,13 +101,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Storage::open(&cli.db_path)?.with_encryption(&miner_pubkey.to_bytes())
     ));
 
+    // Генезис из кода (не из файла) — одинаковый для всех
     {
         let mut st = storage.lock().unwrap();
-        if st.max_genesis_height()?.is_none() && cli.genesis_file.exists() {
-            let data = std::fs::read_to_string(&cli.genesis_file)?;
-            let mut block: Block = serde_json::from_str(&data)?;
-            block.block_hash = block.compute_hash();
-            st.save_genesis_block(&block)?;
+        if st.max_genesis_height()?.is_none() {
+            let genesis = create_genesis_block();
+            st.save_genesis_block(&genesis)?;
+            tracing::info!("Genesis created from built-in code");
         }
     }
 
@@ -210,7 +232,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
-    // HTTP с /tx эндпоинтом
+    // HTTP с /tx
     let http_port = cli.http_port;
     let mempool_http = mempool.clone(); let validator_http = validator.clone(); let peers_http = peers.clone();
     let shutdown_http = shutdown.clone(); let start_time = Instant::now();
@@ -243,7 +265,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // МАЙНИНГ — не стартует пока высота 0
+    // МАЙНИНГ
     if let Some(mk) = load_miner_key(&cli)? {
         let vm = validator.clone(); let mm = mempool.clone(); let sm = storage.clone();
         let dam = developer_address; let sc = serial_counter.clone(); let shm = shutdown.clone(); let pm = peers.clone(); let s_m = sync_ctx.clone();
@@ -259,9 +281,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let should_mine = (poh % target_ticks == 0 || !mem.is_empty()) && val.last_block_height() > 0;
                 let txs_backup = if should_mine { mem.take_batch(100) } else { vec![] };
                 let height = val.last_block_height() + 1;
-                if should_mine {
-                    tracing::info!("[MINING] poh={}, target={}, height={}", poh, target_ticks, height);
-                }
                 drop(mem); drop(val);
                 
                 if should_mine {
@@ -285,7 +304,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             st.save_genesis_block(&block).ok();
                             st.save_utxo_set(val.utxo_set()).ok();
                             let _ = bincode::serialize(&val.poh_snapshot()).ok().and_then(|s| st.save_metadata(POH_SNAPSHOT_KEY, &s).ok());
-                            tracing::info!("[MINING] BLOCK MINED: height={}", height);
                             drop(val); drop(st);
                             if let Ok(mut orch) = s_m.orchestrator.lock() {
                                 let mut v = vm.lock().unwrap(); let mut s = sm.lock().unwrap();
@@ -295,7 +313,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Ok(data) = bincode::serialize(&status) { pm.broadcast(data); }
                         }
                         Err(e) => {
-                            tracing::error!("[MINING] BLOCK FAILED: height={}, error={:?}", height, e);
                             drop(val); drop(st);
                             let mut mem = mm.lock().unwrap();
                             for tx in txs_backup { mem.insert(tx).ok(); }
