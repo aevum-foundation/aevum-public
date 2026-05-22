@@ -30,7 +30,7 @@ use tiny_http::{Response, Method, Header, StatusCode};
 
 const POH_SNAPSHOT_KEY: &str = "poh_snapshot";
 const SERIAL_COUNTER_KEY: &str = "serial_counter";
-const TICKS_PER_BLOCK: u64 = 100;
+const TICKS_PER_BLOCK: u64 = 30;
 
 #[derive(Parser)]
 #[command(name = "aevum-node", version = "0.4.0")]

@@ -29,6 +29,7 @@ impl AtpNode {
         mempool: Arc<StdMutex<Mempool>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let our_key = aevum::crypto::keys::PrivateKey::generate();
+
         let peers = Arc::new(PeersManager::new(our_key));
         let sync_ctx = Arc::new(SyncContext {
             validator,
@@ -37,6 +38,7 @@ impl AtpNode {
             block_buffer: Arc::new(StdMutex::new(BTreeMap::new())),
             replication: None,
             dht: Arc::new(StdMutex::new(crate::p2p::dht::Dht::new([0u8; 32]))),
+            orchestrator: Arc::new(std::sync::Mutex::new(crate::p2p::chain_orchestrator::ChainOrchestrator::new())),
         });
 
         Ok(Self {
