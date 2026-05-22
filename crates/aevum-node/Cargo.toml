@@ -32,6 +32,11 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 bincode = "1.3"
 tempfile = "3"
 clap = { version = "4", features = ["derive"] }
+sled = "0.34"
+[[bin]]
+name = "import-genesis"
+path = "src/bin/import_genesis.rs"
 [[bin]]
 name = "cli-wallet"
 path = "src/bin/cli_wallet.rs"
+sled = "0.34"
