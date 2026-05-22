@@ -15,8 +15,6 @@ use aevum_node::p2p::sync::{AtpMessage, SyncContext, create_status, handle_atp_m
 use aevum_node::p2p::noise::{AtpCipher, TofuStore};
 use aevum_node::p2p::connection::AtpConnection;
 use aevum_node::p2p::pex::PeerExchange;
-use aevum_node::p2p::peer_score::PeerScoring;
-use aevum_node::p2p::addr_manager::AddrManager;
 use aevum_node::p2p::snapshots::SnapshotManager;
 use aevum_node::encrypted_replication::EncryptedReplication;
 use aevum_node::p2p::chain_orchestrator::ChainOrchestrator;
@@ -34,23 +32,14 @@ use tiny_http::{Response, Method, Header, StatusCode};
 const POH_SNAPSHOT_KEY: &str = "poh_snapshot";
 const SERIAL_COUNTER_KEY: &str = "serial_counter";
 const TICKS_PER_BLOCK: u64 = 30;
-
-/// ВШИТЫЙ ГЕНЕЗИС — одинаковый для всех нод
 const GENESIS_ADDRESS: &str = "0ffc25780ab973a85612aad6f0b7abb35bd3fd2222387de0364fd522f79c36e3";
-const GENESIS_AMOUNT: u64 = 21_000_000 * 100_000_000; // 21M AEV в сатоши
+const GENESIS_AMOUNT: u64 = 21_000_000 * 100_000_000;
 
 fn create_genesis_block() -> Block {
     let addr_bytes = hex::decode(GENESIS_ADDRESS).expect("Invalid genesis address");
-    let mut pk_bytes = [0u8; 32];
-    pk_bytes.copy_from_slice(&addr_bytes[..32]);
+    let mut pk_bytes = [0u8; 32]; pk_bytes.copy_from_slice(&addr_bytes[..32]);
     let founder_key = aevum::crypto::keys::PublicKey::from_bytes(pk_bytes).expect("Invalid genesis key");
-    
-    let utxo = JtUtxo::new_global_clean(
-        founder_key, GENESIS_AMOUNT,
-        &[1u8; 32], &[1u8; 32],
-        0, 0, Hash::zero(),
-    ).expect("Genesis UTXO");
-    
+    let utxo = JtUtxo::new_global_clean(founder_key, GENESIS_AMOUNT, &[1u8; 32], &[1u8; 32], 0, 0, Hash::zero()).expect("Genesis UTXO");
     let output = TxOutput::from_jt_utxo(&utxo, 0);
     let tx = Transaction::new(vec![], vec![output], 0);
     Block::genesis(vec![tx])
@@ -97,17 +86,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let our_key = load_miner_key(&cli)?.unwrap_or_else(|| PrivateKey::generate());
     let miner_pubkey = our_key.public_key();
 
-    let storage = Arc::new(StdMutex::new(
-        Storage::open(&cli.db_path)?.with_encryption(&miner_pubkey.to_bytes())
-    ));
+    let storage = Arc::new(StdMutex::new(Storage::open(&cli.db_path)?.with_encryption(&miner_pubkey.to_bytes())));
 
-    // Генезис из кода (не из файла) — одинаковый для всех
     {
         let mut st = storage.lock().unwrap();
         if st.max_genesis_height()?.is_none() {
             let genesis = create_genesis_block();
             st.save_genesis_block(&genesis)?;
-            tracing::info!("Genesis created from built-in code");
+            tracing::info!("Genesis created: hash={}", genesis.block_hash.to_hex());
         }
     }
 
@@ -126,7 +112,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let utxo_set = storage.lock().unwrap().load_utxo_set().unwrap_or_else(|_| UtxoSet::new());
     
     if utxo_set.is_empty() {
-        tracing::info!("UTXO empty, rebuilding from blocks...");
         let mut temp_val = Validator::new(b"aevum_genesis_seed");
         for h in 0..=max_height {
             if let Ok(Some(mut block)) = storage.lock().unwrap().load_genesis_block(h) {
@@ -167,12 +152,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dht = Arc::new(StdMutex::new(aevum_node::p2p::dht::Dht::new(blake3::hash(&miner_pubkey.to_bytes()).into())));
     let replication = Arc::new(StdMutex::new(EncryptedReplication::new(Some(our_key.clone()), 1000)));
     let orchestrator = Arc::new(StdMutex::new(ChainOrchestrator::recover(&storage.lock().unwrap())));
+    let network_height = Arc::new(StdMutex::new(max_height));
 
     let sync_ctx = Arc::new(SyncContext {
         validator: validator.clone(), storage: storage.clone(),
         chain_sync: chain_sync.clone(), block_buffer: block_buffer.clone(),
         replication: Some(replication.clone()), dht: dht.clone(),
-        orchestrator: orchestrator.clone(),
+        orchestrator: orchestrator.clone(), network_height: network_height.clone(),
     });
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -232,10 +218,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
-    // HTTP с /tx
+    // HTTP
     let http_port = cli.http_port;
     let mempool_http = mempool.clone(); let validator_http = validator.clone(); let peers_http = peers.clone();
     let shutdown_http = shutdown.clone(); let start_time = Instant::now();
+    let network_height_http = network_height.clone();
     std::thread::spawn(move || {
         let server = match tiny_http::Server::http(&format!("0.0.0.0:{}", http_port)) { Ok(s) => s, Err(_) => return };
         while !shutdown_http.load(Ordering::SeqCst) {
@@ -244,20 +231,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ("/health", _) => { req.respond(cors_response("{\"status\":\"ok\"}")).ok(); }
                     ("/status", _) => {
                         let val = validator_http.lock().unwrap();
-                        let s = format!("{{\"height\":{},\"peers\":{},\"mempool\":{},\"utxos\":{},\"poh_tick\":{},\"supply\":{},\"uptime_sec\":{}}}",
+                        let nh = *network_height_http.lock().unwrap();
+                        let synced = val.last_block_height() >= nh;
+                        let s = format!("{{\"height\":{},\"peers\":{},\"mempool\":{},\"utxos\":{},\"poh_tick\":{},\"supply\":{},\"uptime_sec\":{},\"network_height\":{},\"synced\":{}}}",
                             val.last_block_height(), peers_http.peer_count(), mempool_http.lock().unwrap().len(),
-                            val.utxo_set().len(), val.poh().current_tick_number(), val.utxo_set().total_supply(), start_time.elapsed().as_secs());
+                            val.utxo_set().len(), val.poh().current_tick_number(), val.utxo_set().total_supply(), start_time.elapsed().as_secs(), nh, synced);
                         req.respond(cors_response(&s)).ok();
                     }
                     ("/tx", &Method::Post) => {
-                        let mut body = String::new();
-                        req.as_reader().read_to_string(&mut body).ok();
+                        let mut body = String::new(); req.as_reader().read_to_string(&mut body).ok();
                         if let Ok(tx) = serde_json::from_str::<Transaction>(&body) {
                             mempool_http.lock().unwrap().insert(tx).ok();
                             req.respond(cors_response("{\"status\":\"ok\"}")).ok();
-                        } else {
-                            req.respond(cors_response("{\"status\":\"err\"}")).ok();
-                        }
+                        } else { req.respond(cors_response("{\"status\":\"err\"}")).ok(); }
                     }
                     _ => { req.respond(Response::from_string("404").with_status_code(StatusCode(404))).ok(); }
                 }
@@ -265,13 +251,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // МАЙНИНГ
+    // МАЙНИНГ с заморозкой пока не синхронизирован
     if let Some(mk) = load_miner_key(&cli)? {
         let vm = validator.clone(); let mm = mempool.clone(); let sm = storage.clone();
         let dam = developer_address; let sc = serial_counter.clone(); let shm = shutdown.clone(); let pm = peers.clone(); let s_m = sync_ctx.clone();
+        let nh = network_height.clone();
         std::thread::spawn(move || {
             while !shm.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_secs(1));
+                
+                let network_h = *nh.lock().unwrap();
+                let our_h = vm.lock().unwrap().last_block_height();
+                let has_peers = pm.peer_count() > 0;
+                
+                if has_peers && our_h < network_h {
+                    continue; // Ждём синхронизации
+                }
+                
                 let mut val = vm.lock().unwrap();
                 let mut mem = mm.lock().unwrap();
                 val.tick_poh();
@@ -297,13 +293,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     drop(serial);
                     txs.insert(0, coinbase);
                     let mut block = Block::new(val.last_block_hash(), height, poh, poh + TICKS_PER_BLOCK, txs,
-                        val.utxo_set().get_state_root(),
-                        supply + Economics::block_reward_satoshi(height) + total_fees, None);
+                        val.utxo_set().get_state_root(), supply + Economics::block_reward_satoshi(height) + total_fees, None);
                     match val.validate_and_apply(&mut block) {
                         Ok(_) => {
                             st.save_genesis_block(&block).ok();
                             st.save_utxo_set(val.utxo_set()).ok();
                             let _ = bincode::serialize(&val.poh_snapshot()).ok().and_then(|s| st.save_metadata(POH_SNAPSHOT_KEY, &s).ok());
+                            { let mut nnh = nh.lock().unwrap(); if height > *nnh { *nnh = height; } }
                             drop(val); drop(st);
                             if let Ok(mut orch) = s_m.orchestrator.lock() {
                                 let mut v = vm.lock().unwrap(); let mut s = sm.lock().unwrap();
