@@ -102,10 +102,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let utxo_set = storage.lock().unwrap().load_utxo_set().unwrap_or_else(|_| UtxoSet::new());
     
-    // Проверка целостности: если UTXO не соответствует количеству блоков — перестроить
-    if utxo_set.total_supply() == 0 || utxo_set.len() < max_height as usize {
-        tracing::info!("UTXO mismatch: supply={}, utxos={}, blocks={}. Rebuilding...",
-            utxo_set.total_supply(), utxo_set.len(), max_height);
+    if utxo_set.is_empty() {
+        tracing::info!("UTXO empty, rebuilding from blocks...");
         let mut temp_val = Validator::new(b"aevum_genesis_seed");
         for h in 0..=max_height {
             if let Ok(Some(mut block)) = storage.lock().unwrap().load_genesis_block(h) {
@@ -117,15 +115,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             validator.set_last_block(lb.block_hash, lb.height, lb.poh_tick_end);
         }
         validator.last_poh_tick_end = validator.poh().current_tick_number();
-        tracing::info!("UTXO rebuilt: supply={}, utxos={}", validator.utxo_set().total_supply(), validator.utxo_set().len());
-    } else if !utxo_set.is_empty() {
+    } else {
         validator.load_utxo_set(utxo_set);
         validator.genesis_applied = true;
         if let Some(lb) = storage.lock().unwrap().load_genesis_block(max_height)? {
             validator.set_last_block(lb.block_hash, lb.height, lb.poh_tick_end);
         }
-    } else if let Some(gb) = storage.lock().unwrap().load_genesis_block(0)? {
-        let mut gb = gb; validator.validate_and_apply(&mut gb)?;
+        // Установить total_supply из блока если 0
+        if validator.utxo_set().total_supply() == 0 {
+            if let Ok(Some(lb)) = storage.lock().unwrap().load_genesis_block(max_height) {
+                validator.utxo_set_mut().set_total_supply(lb.total_supply);
+                tracing::info!("Supply set from block {}: {}", max_height, lb.total_supply);
+                validator.last_poh_tick_end = validator.poh().current_tick_number();
+                tracing::info!("PoH reset to {}", validator.last_poh_tick_end);
+            }
+        }
     }
 
     let validator = Arc::new(StdMutex::new(validator));
@@ -151,10 +155,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let shutdown = Arc::new(AtomicBool::new(false));
-    ctrlc::set_handler({
-        let s = shutdown.clone();
-        move || { tracing::info!("Ctrl+C"); s.store(true, Ordering::SeqCst); }
-    }).expect("Ctrl+C handler");
+    ctrlc::set_handler({ let s = shutdown.clone(); move || { tracing::info!("Ctrl+C"); s.store(true, Ordering::SeqCst); } }).expect("Ctrl+C handler");
 
     // ATP
     let server_listen_addr = cli.listen_addr.clone();
@@ -233,11 +234,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // МАЙНИНГ
+    // МАЙНИНГ С ЛОГАМИ
     if let Some(mk) = load_miner_key(&cli)? {
         let vm = validator.clone(); let mm = mempool.clone(); let sm = storage.clone();
         let dam = developer_address; let sc = serial_counter.clone(); let shm = shutdown.clone(); let pm = peers.clone(); let s_m = sync_ctx.clone();
         std::thread::spawn(move || {
+            tracing::info!("MINING THREAD STARTED");
             while !shm.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_secs(1));
                 let mut val = vm.lock().unwrap();
@@ -249,11 +251,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let should_mine = poh % target_ticks == 0 || !mem.is_empty();
                 let txs_backup = if should_mine { mem.take_batch(100) } else { vec![] };
                 let height = val.last_block_height() + 1;
+                if should_mine {
+                    tracing::info!("[MINING] poh={}, target={}, should_mine=true, height={}, mem={}", poh, target_ticks, height, txs_backup.len());
+                }
                 drop(mem); drop(val);
                 
                 if should_mine {
                     let mut val = vm.lock().unwrap();
                     let mut st = sm.lock().unwrap();
+                    let supply = val.utxo_set().total_supply();
+                    tracing::info!("[MINING] supply={}, last_block_hash={}", supply, val.last_block_hash().to_hex());
                     let mut txs = txs_backup.clone();
                     let total_fees: u64 = txs.iter().map(|tx| {
                         let a: u64 = tx.outputs.iter().map(|o| o.amount).sum();
@@ -265,23 +272,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     txs.insert(0, coinbase);
                     let mut block = Block::new(val.last_block_hash(), height, poh, poh + TICKS_PER_BLOCK, txs,
                         val.utxo_set().get_state_root(),
-                        val.utxo_set().total_supply() + Economics::block_reward_satoshi(height) + total_fees, None);
-                    if val.validate_and_apply(&mut block).is_ok() {
-                        st.save_genesis_block(&block).ok();
-                        st.save_utxo_set(val.utxo_set()).ok();
-                        let _ = bincode::serialize(&val.poh_snapshot()).ok().and_then(|s| st.save_metadata(POH_SNAPSHOT_KEY, &s).ok());
-                        tracing::info!("BLOCK MINED: height={}", height);
-                        drop(val); drop(st);
-                        if let Ok(mut orch) = s_m.orchestrator.lock() {
-                            let mut v = vm.lock().unwrap(); let mut s = sm.lock().unwrap();
-                            let _ = orch.process_chain(&mut v, &mut s, &s_m, &pm);
+                        supply + Economics::block_reward_satoshi(height) + total_fees, None);
+                    tracing::info!("[MINING] validate_and_apply: height={}, prev_hash={}, poh_start={}, poh_end={}",
+                        height, val.last_block_hash().to_hex(), block.poh_tick_start, block.poh_tick_end);
+                    match val.validate_and_apply(&mut block) {
+                        Ok(_) => {
+                            st.save_genesis_block(&block).ok();
+                            st.save_utxo_set(val.utxo_set()).ok();
+                            let _ = bincode::serialize(&val.poh_snapshot()).ok().and_then(|s| st.save_metadata(POH_SNAPSHOT_KEY, &s).ok());
+                            tracing::info!("[MINING] BLOCK MINED: height={}, hash={}", height, block.block_hash.to_hex());
+                            drop(val); drop(st);
+                            if let Ok(mut orch) = s_m.orchestrator.lock() {
+                                let mut v = vm.lock().unwrap(); let mut s = sm.lock().unwrap();
+                                let _ = orch.process_chain(&mut v, &mut s, &s_m, &pm);
+                            }
+                            let status = create_status(&s_m);
+                            if let Ok(data) = bincode::serialize(&status) { pm.broadcast(data); }
                         }
-                        let status = create_status(&s_m);
-                        if let Ok(data) = bincode::serialize(&status) { pm.broadcast(data); }
-                    } else {
-                        drop(val); drop(st);
-                        let mut mem = mm.lock().unwrap();
-                        for tx in txs_backup { mem.insert(tx).ok(); }
+                        Err(e) => {
+                            tracing::error!("[MINING] BLOCK FAILED: height={}, error={:?}", height, e);
+                            drop(val); drop(st);
+                            let mut mem = mm.lock().unwrap();
+                            for tx in txs_backup { mem.insert(tx).ok(); }
+                        }
                     }
                 }
             }

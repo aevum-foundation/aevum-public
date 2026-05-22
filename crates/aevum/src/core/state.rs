@@ -82,6 +82,7 @@ impl UtxoSet {
     pub fn len(&self) -> usize { self.utxos.len() }
     pub fn is_empty(&self) -> bool { self.utxos.is_empty() }
     pub fn total_supply(&self) -> u64 { self.total_supply }
+    pub fn set_total_supply(&mut self, supply: u64) { self.total_supply = supply; }
     pub fn state_root(&mut self) -> Hash { if self.dirty { self.recompute_root(); } self.state_root }
     pub fn get_state_root(&self) -> Hash { self.state_root }
     pub fn all(&self) -> impl Iterator<Item = (&Hash, &JtUtxo)> { self.utxos.iter() }
