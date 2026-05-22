@@ -20,6 +20,7 @@ use aevum_node::encrypted_replication::EncryptedReplication;
 use aevum_node::p2p::chain_orchestrator::ChainOrchestrator;
 use clap::Parser;
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -122,13 +123,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(lb) = storage.lock().unwrap().load_genesis_block(max_height)? {
             validator.set_last_block(lb.block_hash, lb.height, lb.poh_tick_end);
         }
-        // Установить total_supply из блока если 0
         if validator.utxo_set().total_supply() == 0 {
             if let Ok(Some(lb)) = storage.lock().unwrap().load_genesis_block(max_height) {
                 validator.utxo_set_mut().set_total_supply(lb.total_supply);
-                tracing::info!("Supply set from block {}: {}", max_height, lb.total_supply);
                 validator.last_poh_tick_end = validator.poh().current_tick_number();
-                tracing::info!("PoH reset to {}", validator.last_poh_tick_end);
             }
         }
     }
@@ -212,7 +210,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
-    // HTTP
+    // HTTP с /tx эндпоинтом
     let http_port = cli.http_port;
     let mempool_http = mempool.clone(); let validator_http = validator.clone(); let peers_http = peers.clone();
     let shutdown_http = shutdown.clone(); let start_time = Instant::now();
@@ -229,18 +227,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             val.utxo_set().len(), val.poh().current_tick_number(), val.utxo_set().total_supply(), start_time.elapsed().as_secs());
                         req.respond(cors_response(&s)).ok();
                     }
+                    ("/tx", &Method::Post) => {
+                        let mut body = String::new();
+                        req.as_reader().read_to_string(&mut body).ok();
+                        if let Ok(tx) = serde_json::from_str::<Transaction>(&body) {
+                            mempool_http.lock().unwrap().insert(tx).ok();
+                            req.respond(cors_response("{\"status\":\"ok\"}")).ok();
+                        } else {
+                            req.respond(cors_response("{\"status\":\"err\"}")).ok();
+                        }
+                    }
                     _ => { req.respond(Response::from_string("404").with_status_code(StatusCode(404))).ok(); }
                 }
             }
         }
     });
 
-    // МАЙНИНГ С ЛОГАМИ
+    // МАЙНИНГ — не стартует пока высота 0
     if let Some(mk) = load_miner_key(&cli)? {
         let vm = validator.clone(); let mm = mempool.clone(); let sm = storage.clone();
         let dam = developer_address; let sc = serial_counter.clone(); let shm = shutdown.clone(); let pm = peers.clone(); let s_m = sync_ctx.clone();
         std::thread::spawn(move || {
-            tracing::info!("MINING THREAD STARTED");
             while !shm.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_secs(1));
                 let mut val = vm.lock().unwrap();
@@ -249,11 +256,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let poh = val.poh().current_tick_number();
                 let active_miners = pm.peer_count().max(1) as u64;
                 let target_ticks = TICKS_PER_BLOCK.saturating_sub((active_miners / 10).min(TICKS_PER_BLOCK - 10));
-                let should_mine = poh % target_ticks == 0 || !mem.is_empty();
+                let should_mine = (poh % target_ticks == 0 || !mem.is_empty()) && val.last_block_height() > 0;
                 let txs_backup = if should_mine { mem.take_batch(100) } else { vec![] };
                 let height = val.last_block_height() + 1;
                 if should_mine {
-                    tracing::info!("[MINING] poh={}, target={}, should_mine=true, height={}, mem={}", poh, target_ticks, height, txs_backup.len());
+                    tracing::info!("[MINING] poh={}, target={}, height={}", poh, target_ticks, height);
                 }
                 drop(mem); drop(val);
                 
@@ -261,7 +268,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut val = vm.lock().unwrap();
                     let mut st = sm.lock().unwrap();
                     let supply = val.utxo_set().total_supply();
-                    tracing::info!("[MINING] supply={}, last_block_hash={}", supply, val.last_block_hash().to_hex());
                     let mut txs = txs_backup.clone();
                     let total_fees: u64 = txs.iter().map(|tx| {
                         let a: u64 = tx.outputs.iter().map(|o| o.amount).sum();
@@ -274,14 +280,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut block = Block::new(val.last_block_hash(), height, poh, poh + TICKS_PER_BLOCK, txs,
                         val.utxo_set().get_state_root(),
                         supply + Economics::block_reward_satoshi(height) + total_fees, None);
-                    tracing::info!("[MINING] validate_and_apply: height={}, prev_hash={}, poh_start={}, poh_end={}",
-                        height, val.last_block_hash().to_hex(), block.poh_tick_start, block.poh_tick_end);
                     match val.validate_and_apply(&mut block) {
                         Ok(_) => {
                             st.save_genesis_block(&block).ok();
                             st.save_utxo_set(val.utxo_set()).ok();
                             let _ = bincode::serialize(&val.poh_snapshot()).ok().and_then(|s| st.save_metadata(POH_SNAPSHOT_KEY, &s).ok());
-                            tracing::info!("[MINING] BLOCK MINED: height={}, hash={}", height, block.block_hash.to_hex());
+                            tracing::info!("[MINING] BLOCK MINED: height={}", height);
                             drop(val); drop(st);
                             if let Ok(mut orch) = s_m.orchestrator.lock() {
                                 let mut v = vm.lock().unwrap(); let mut s = sm.lock().unwrap();
@@ -307,7 +311,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::thread::spawn(move || {
         while !shutdown_hb.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_secs(30));
-            let h = hb_ctx.validator.lock().unwrap().last_block_height();
             let status = create_status(&hb_ctx);
             if let Ok(data) = bincode::serialize(&status) { hb_peers.broadcast(data); }
         }
