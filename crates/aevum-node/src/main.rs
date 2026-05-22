@@ -111,6 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         validator.load_utxo_set(temp_val.utxo_set().clone());
+        validator.genesis_applied = true;
         if let Some(lb) = storage.lock().unwrap().load_genesis_block(max_height)? {
             validator.set_last_block(lb.block_hash, lb.height, lb.poh_tick_end);
         }
