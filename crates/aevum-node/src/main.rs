@@ -91,6 +91,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let mut st = storage.lock().unwrap();
         if st.max_genesis_height()?.is_none() {
+        } else {
+            let builtin = create_genesis_block();
+            if let Ok(Some(existing)) = st.load_genesis_block(0) {
+                if existing.block_hash != builtin.block_hash {
+                    tracing::warn!("Genesis mismatch! Auto-migrating to built-in genesis...");
+                    let max_h = st.max_genesis_height()?.unwrap_or(0);
+                    for h in 1..=max_h {
+                        if let Ok(Some(block)) = st.load_genesis_block(h) {
+                            st.save_my_block(h, &block).ok();
+                            st.delete_genesis_block(h).ok();
+                        }
+                    }
+                    st.delete_genesis_block(0).ok();
+                    st.save_genesis_block(&builtin)?;
+                    tracing::info!("Genesis migrated. Old blocks saved to my_blocks.");
+                }
+            }
             let genesis = create_genesis_block();
             st.save_genesis_block(&genesis)?;
             tracing::info!("Genesis created: hash={}", genesis.block_hash.to_hex());
@@ -274,7 +291,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let poh = val.poh().current_tick_number();
                 let active_miners = pm.peer_count().max(1) as u64;
                 let target_ticks = TICKS_PER_BLOCK.saturating_sub((active_miners / 10).min(TICKS_PER_BLOCK - 10));
-                let should_mine = (poh % target_ticks == 0 || !mem.is_empty()) && val.last_block_height() > 0;
+                let should_mine = (poh % target_ticks == 0 || !mem.is_empty()) && (pm.peer_count() == 0 || val.last_block_height() >= *nh.lock().unwrap());
                 let txs_backup = if should_mine { mem.take_batch(100) } else { vec![] };
                 let height = val.last_block_height() + 1;
                 drop(mem); drop(val);

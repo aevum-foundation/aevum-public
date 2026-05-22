@@ -16,6 +16,7 @@ const MAX_FORK_QUEUE: usize = 16;
 const MAX_CANDIDATES_PER_PEER: usize = 2;
 const FORK_CANDIDATE_TTL: Duration = Duration::from_secs(300);
 const CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(600);
+const FORK_QUEUE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub enum OrchestratorError {
@@ -98,18 +99,9 @@ impl ChainOrchestrator {
     pub fn new() -> Self {
         ChainOrchestrator { wal: WriteAheadLog::new(), fork_queue: ForkQueue::new(), pending_confirmation: None, confirmation_counter: 0, processed_height: 0, metrics: OrchestratorMetrics::default() }
     }
-
     pub fn recover(st: &Storage) -> Self {
         let wal = WriteAheadLog::recover(st);
-        let mut processed = st.load_metadata("orch_processed_height").ok().flatten().and_then(|d| bincode::deserialize::<u64>(&d).ok()).unwrap_or(0);
-        // Если processed=0 но блоки есть (после миграции) — восстанавливаем высоту
-        if processed == 0 {
-            if let Ok(Some(max_h)) = st.max_genesis_height() {
-                processed = max_h;
-                tracing::info!("[ORCH] Recovered height from genesis blocks: {}", max_h);
-            }
-        }
-        tracing::info!("[ORCH] recover: processed_height={}", processed);
+        let processed = st.load_metadata("orch_processed_height").ok().flatten().and_then(|d| bincode::deserialize::<u64>(&d).ok()).unwrap_or(0);
         ChainOrchestrator { wal: wal.unwrap_or_else(WriteAheadLog::new), fork_queue: ForkQueue::new(), pending_confirmation: None, confirmation_counter: 0, processed_height: processed, metrics: OrchestratorMetrics::default() }
     }
 
@@ -122,23 +114,10 @@ impl ChainOrchestrator {
         if current <= self.processed_height { return Ok(0); }
         let mut processed = 0u64;
         for h in (self.processed_height + 1)..=current {
-            let block = match st.load_block(h) { Ok(Some(b)) => b, _ => continue };
+            let block = match st.load_genesis_block(h) { Ok(Some(b)) => b, _ => continue };
             if !self.verify_block(&block, h, st)? { continue; }
-            if h > 1 {
-                if let Ok(Some(prev)) = st.load_block(h - 1) {
-                    if block.prev_hash != prev.block_hash {
-                        self.metrics.forks_detected += 1;
-                        self.handle_fork(val, st, h, _ctx, _peers)?;
-                        continue;
-                    }
-                }
-            }
-            self.analyze(&block, h);
-            self.distribute(&block);
-            self.processed_height = h;
-            processed += 1;
-            self.metrics.blocks_analyzed += 1;
-            self.metrics.last_height_processed = h;
+            self.analyze(&block, h); self.distribute(&block);
+            self.processed_height = h; processed += 1; self.metrics.blocks_analyzed += 1; self.metrics.last_height_processed = h;
             if h % CHECKPOINT_INTERVAL == 0 { CheckpointManager::save(st, h, block.block_hash)?; if h >= 100 { CheckpointManager::finalize(st, h - 100).ok(); } self.save_progress(st)?; }
         }
         self.save_progress(st)?;
@@ -147,33 +126,70 @@ impl ChainOrchestrator {
 
     fn verify_block(&self, block: &Block, h: u64, st: &Storage) -> Result<bool, OrchestratorError> {
         if block.compute_hash() != block.block_hash { return Err(OrchestratorError::InvalidBlock { height: h, expected_hash: block.compute_hash().to_hex(), got_hash: block.block_hash.to_hex() }); }
-        if h > 0 { if let Ok(Some(p)) = st.load_block(h - 1) { if block.prev_hash != p.block_hash { return Err(OrchestratorError::InvalidBlock { height: h, expected_hash: p.block_hash.to_hex(), got_hash: block.prev_hash.to_hex() }); } } }
+        if h > 0 { if let Ok(Some(p)) = st.load_genesis_block(h - 1) { if block.prev_hash != p.block_hash { return Err(OrchestratorError::InvalidBlock { height: h, expected_hash: p.block_hash.to_hex(), got_hash: block.prev_hash.to_hex() }); } } }
+        if block.transactions.is_empty() { return Err(OrchestratorError::ValidationFailed { height: h, reason: "Empty".into() }); }
         let cb = block.transactions.iter().filter(|tx| tx.inputs.is_empty()).count();
         if cb > 1 { return Err(OrchestratorError::ValidationFailed { height: h, reason: "Multi coinbase".into() }); }
         if cb == 0 { return Err(OrchestratorError::ValidationFailed { height: h, reason: "No coinbase".into() }); }
         Ok(true)
     }
 
-    fn analyze(&mut self, block: &Block, h: u64) { let n = block.transactions.len(); let s: u64 = block.transactions.iter().flat_map(|tx| tx.outputs.iter()).map(|o| o.amount).sum(); tracing::info!("[ORCH] Block {}: {} txs, {} AEV", h, n, s as f64 / 100_000_000.0); }
+    fn analyze(&mut self, block: &Block, h: u64) { let n = block.transactions.len(); let s: u64 = block.transactions.iter().flat_map(|tx| tx.outputs.iter()).map(|o| o.amount).sum(); tracing::debug!("[ORCH] Block {}: {} txs, {} AEV", h, n, s as f64 / 100_000_000.0); }
     fn distribute(&mut self, block: &Block) { for tx in &block.transactions { if tx.inputs.is_empty() { for o in &tx.outputs { self.metrics.rewards_distributed += o.amount; } } } }
 
-    fn handle_fork(&mut self, val: &mut Validator, st: &mut Storage, h: u64, _ctx: &SyncContext, _peers: &Arc<PeersManager>) -> Result<(), OrchestratorError> {
-        let our = val.last_block_height(); let mut refund = 0u64; let mut rewards: Vec<(PublicKey, u64)> = Vec::new();
-        for h2 in h..=our { if let Ok(Some(b)) = st.load_block(h2) { let d = bincode::serialize(&b).map_err(|e| OrchestratorError::StorageFailed { operation: "ser".into(), detail: format!("{:?}", e) })?; st.save_metadata(&format!("my_block_{}", h2), &d).map_err(|e| OrchestratorError::StorageFailed { operation: "save".into(), detail: format!("{:?}", e) })?; for tx in &b.transactions { if tx.inputs.is_empty() { for o in &tx.outputs { refund += o.amount; rewards.push((o.owner.clone(), o.amount)); } } } st.delete_block(h2).map_err(|e| OrchestratorError::StorageFailed { operation: "del".into(), detail: format!("{:?}", e) })?; } }
-        if let Ok(Some(g)) = st.load_block(0) { let mut tv = Validator::new(b"aevum_genesis_seed"); let mut g = g; if tv.validate_and_apply(&mut g).is_ok() { val.load_utxo_set(tv.utxo_set().clone()); } val.set_last_block(g.block_hash, 0, g.poh_tick_end); }
-        for (miner, amt) in &rewards { if let Ok(u) = JtUtxo::new_global_clean(miner.clone(), *amt, &[1u8; 32], &[1u8; 32], our + 1, 0, Hash::zero()) { val.utxo_set_mut().add(u); } }
-        // Сохраняем возвраты в Storage чтобы не терялись при перезапуске
-        let utxo_set = val.utxo_set().clone();
-        st.save_utxo_set(&utxo_set).map_err(|e| OrchestratorError::StorageFailed { operation: "save_utxo".into(), detail: format!("{:?}", e) })?;
-        self.metrics.total_refunded += refund; self.metrics.switches_performed += 1; self.processed_height = 0;
-        self.wal.log(st, "fork_done", 0, None)?;
-        Ok(())
-    }
+    // ============================================================
+    // resolve_fork — вызывается из flush_block_buffer
+    // ============================================================
+    pub fn resolve_fork(&mut self, val: &mut Validator, st: &mut Storage, fork_height: u64,
+        peer_blocks: &[(u64, Vec<u8>)], _ctx: &SyncContext, _peers: &Arc<PeersManager>) -> Result<u64, OrchestratorError>
+    {
+        let our_height = val.last_block_height();
+        self.wal.log(st, "resolve_fork", fork_height, None)?;
+        self.metrics.forks_detected += 1;
 
-    pub fn synchronize_miner(&mut self, ctx: &SyncContext, pid: &[u8; 20], ph: u64, peers: &Arc<PeersManager>) {
-        let our = ctx.validator.lock().unwrap().last_block_height(); if ph >= our { return; }
-        self.metrics.miners_synchronized += 1;
-        let req = AtpMessage::HeaderRequest { from: ph + 1, to: our };
-        if let Ok(d) = bincode::serialize(&req) { peers.send_to(pid, d); }
+        let mut refund = 0u64;
+        let mut rewards: Vec<(PublicKey, u64)> = Vec::new();
+
+        for h in fork_height..=our_height {
+            if let Ok(Some(block)) = st.load_genesis_block(h) {
+                st.save_my_block(h, &block).map_err(|e| OrchestratorError::StorageFailed { operation: "save_my".into(), detail: format!("{:?}", e) })?;
+                for tx in &block.transactions {
+                    if tx.inputs.is_empty() { for o in &tx.outputs { refund += o.amount; rewards.push((o.owner.clone(), o.amount)); } }
+                }
+                st.delete_genesis_block(h).map_err(|e| OrchestratorError::StorageFailed { operation: "del".into(), detail: format!("{:?}", e) })?;
+            }
+        }
+
+        if let Ok(Some(genesis)) = st.load_genesis_block(0) {
+            let mut tv = Validator::new(b"aevum_genesis_seed");
+            let mut g = genesis;
+            if tv.validate_and_apply(&mut g).is_ok() { val.load_utxo_set(tv.utxo_set().clone()); }
+            val.set_last_block(g.block_hash, 0, g.poh_tick_end);
+        }
+
+        for (miner, amt) in &rewards {
+            let utxo = JtUtxo::new_global_clean(miner.clone(), *amt, &[1u8; 32], &[1u8; 32], fork_height + 1, 0, Hash::zero());
+            if let Ok(u) = utxo { val.utxo_set_mut().add(u); }
+        }
+        self.metrics.total_refunded += refund;
+        self.metrics.switches_performed += 1;
+
+        let mut applied = 0u64;
+        for (h, bytes) in peer_blocks {
+            let h = *h;
+            if h <= val.last_block_height() || h != val.last_block_height() + 1 { continue; }
+            if let Ok(block) = bincode::deserialize::<Block>(bytes) {
+                match val.validate_and_apply(&mut block.clone()) {
+                    Ok(_) => { st.save_genesis_block(&block).ok(); st.save_utxo_set(val.utxo_set()).ok(); applied += 1; }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        self.processed_height = val.last_block_height();
+        self.wal.log(st, "fork_done", val.last_block_height(), None)?;
+        self.save_progress(st)?;
+        tracing::info!("[ORCH] Fork resolved: saved={}, refund={}, applied={}", rewards.len(), refund, applied);
+        Ok(applied)
     }
 }

@@ -57,7 +57,8 @@ impl AtpConnection {
         if self.peer_height > our_height {
             let from = if our_height == 0 { 1 } else { our_height + 1 };
             tracing::info!("[ATP] start_sync: requesting headers {}-{}", from, self.peer_height);
-            let req = AtpMessage::HeaderRequest { from, to: self.peer_height };
+            let to = self.peer_height.min(from + 499);
+            let req = AtpMessage::HeaderRequest { from, to };
             if let Ok(data) = bincode::serialize(&req) { self.pending_outgoing.push(data); }
         }
         let dht = &self.ctx.dht;

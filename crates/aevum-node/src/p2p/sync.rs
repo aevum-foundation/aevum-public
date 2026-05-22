@@ -58,15 +58,12 @@ pub fn create_status(ctx: &SyncContext) -> AtpMessage {
 pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8; 20], peers: &Arc<PeersManager>) {
     match msg {
         AtpMessage::Status { height, .. } => {
-            // Обновляем высоту сети
-            if height > 0 {
-                let mut nh = ctx.network_height.lock().unwrap();
-                if height > *nh { *nh = height; }
-            }
+            if height > 0 { let mut nh = ctx.network_height.lock().unwrap(); if height > *nh { *nh = height; } }
             let my = ctx.validator.lock().unwrap().last_block_height();
             if height > my {
                 let from = if my == 0 { 1 } else { my + 1 };
-                let req = AtpMessage::HeaderRequest { from, to: height };
+                let to = height.min(from + 499);
+                let req = AtpMessage::HeaderRequest { from, to };
                 if let Ok(data) = bincode::serialize(&req) { peers.send_to(peer_id, data); }
             }
         }
@@ -76,8 +73,7 @@ pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8
             for h in from..=to {
                 if let Ok(Some(block)) = st.load_genesis_block(h) {
                     headers.push(BlockHeader {
-                        height: block.height, block_hash: block.block_hash.0,
-                        prev_hash: block.prev_hash.0,
+                        height: block.height, block_hash: block.block_hash.0, prev_hash: block.prev_hash.0,
                         poh_tick_start: block.poh_tick_start, poh_tick_end: block.poh_tick_end,
                         state_root: block.state_root.0, total_supply: block.total_supply,
                     });
@@ -90,11 +86,7 @@ pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8
             if !headers.is_empty() {
                 let from = headers.iter().map(|h| h.height).min().unwrap();
                 let to = headers.iter().map(|h| h.height).max().unwrap();
-                // Обновляем высоту сети
-                {
-                    let mut nh = ctx.network_height.lock().unwrap();
-                    if to > *nh { *nh = to; }
-                }
+                { let mut nh = ctx.network_height.lock().unwrap(); if to > *nh { *nh = to; } }
                 let req = AtpMessage::BlockRequest { request_id: rand::random(), from, to };
                 if let Ok(data) = bincode::serialize(&req) { peers.send_to(peer_id, data); }
             }
@@ -111,20 +103,15 @@ pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8
             if let Ok(data) = bincode::serialize(&resp) { peers.send_to(peer_id, data); }
         }
         AtpMessage::BlockResponse { blocks, .. } => {
-            // Обновляем высоту сети
             if let Some((last_h, _)) = blocks.last() {
-                let mut nh = ctx.network_height.lock().unwrap();
-                if *last_h > *nh { *nh = *last_h; }
+                let mut nh = ctx.network_height.lock().unwrap(); if *last_h > *nh { *nh = *last_h; }
             }
             let mut buffer = ctx.block_buffer.lock().unwrap();
             for (height, bytes) in blocks { buffer.insert(height, bytes); }
             drop(buffer);
-            flush_block_buffer(ctx);
+            flush_block_buffer(ctx, peers);
         }
-        AtpMessage::Ping { nonce } => {
-            let pong = AtpMessage::Pong { nonce };
-            if let Ok(data) = bincode::serialize(&pong) { peers.send_to(peer_id, data); }
-        }
+        AtpMessage::Ping { nonce } => { let pong = AtpMessage::Pong { nonce }; if let Ok(data) = bincode::serialize(&pong) { peers.send_to(peer_id, data); } }
         AtpMessage::GetPeers { count } => {
             let msg = crate::p2p::pex::PeerExchange::create_peer_list(peers, count as usize);
             if let Ok(data) = bincode::serialize(&msg) { peers.send_to(peer_id, data); }
@@ -137,7 +124,7 @@ pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8
     }
 }
 
-fn flush_block_buffer(ctx: &SyncContext) {
+fn flush_block_buffer(ctx: &SyncContext, peers: &Arc<PeersManager>) {
     let mut val = ctx.validator.lock().unwrap();
     let mut st = ctx.storage.lock().unwrap();
     let mut buffer = ctx.block_buffer.lock().unwrap();
@@ -150,21 +137,37 @@ fn flush_block_buffer(ctx: &SyncContext) {
             let block: Block = match bincode::deserialize(&block_bytes) { Ok(b) => b, Err(_) => continue, };
             let height = block.height;
             match val.validate_and_apply(&mut block.clone()) {
-                Ok(_) => {
-                    st.save_genesis_block(&block).ok();
-                    st.save_utxo_set(val.utxo_set()).ok();
-                    ctx.chain_sync.lock().unwrap().mark_received(height);
-                    applied += 1;
-                }
+                Ok(_) => { st.save_genesis_block(&block).ok(); st.save_utxo_set(val.utxo_set()).ok(); ctx.chain_sync.lock().unwrap().mark_received(height); applied += 1; }
                 Err(e) => {
-                    tracing::warn!("[SYNC] Block {} failed: {:?}", height, e);
-                    break;
+                    let err_str = format!("{:?}", e);
+                    if err_str.contains("prev_hash") {
+                        tracing::warn!("[SYNC] Fork at {} — resolve_fork", height);
+                        let mut all_blocks: Vec<(u64, Vec<u8>)> = vec![(height, block_bytes)];
+                        let keys: Vec<u64> = buffer.iter().map(|(k, _)| *k).collect();
+                        for k in keys { if let Some(v) = buffer.remove(&k) { all_blocks.push((k, v)); } }
+                        drop(val); drop(st); drop(buffer);
+                        if let Ok(mut orch) = ctx.orchestrator.lock() {
+                            let mut v = ctx.validator.lock().unwrap();
+                            let mut s = ctx.storage.lock().unwrap();
+                            match orch.resolve_fork(&mut v, &mut s, height, &all_blocks, ctx, peers) {
+                                Ok(n) => {
+                                    tracing::info!("[SYNC] Fork resolved: {} blocks", n);
+                                    if n == 0 {
+                                        let nh = *ctx.network_height.lock().unwrap();
+                                        if nh > 0 {
+                                            let req = AtpMessage::HeaderRequest { from: 1, to: nh };
+                                            if let Ok(data) = bincode::serialize(&req) { peers.broadcast(data); }
+                                        }
+                                    }
+                                }
+                                Err(e) => tracing::error!("[SYNC] resolve_fork: {}", e),
+                            }
+                        }
+                        return;
+                    } else { tracing::warn!("[SYNC] Block {} failed: {:?}", height, e); break; }
                 }
             }
         } else { break; }
     }
-
-    if applied > 0 {
-        tracing::info!("[SYNC] Applied {} blocks, height: {} → {}", applied, our_before, val.last_block_height());
-    }
+    if applied > 0 { tracing::info!("[SYNC] Applied {} blocks, height: {} → {}", applied, our_before, val.last_block_height()); }
 }
