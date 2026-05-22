@@ -85,7 +85,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut block: Block = serde_json::from_str(&data)?;
             block.block_hash = block.compute_hash();
             st.save_genesis_block(&block)?;
-            tracing::info!("Genesis loaded");
         }
     }
 
@@ -100,36 +99,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(snap) = storage.lock().unwrap().load_metadata(POH_SNAPSHOT_KEY)? {
         if let Ok(snap) = bincode::deserialize::<PohSnapshot>(&snap) { validator.restore_poh_from_snapshot(&snap); }
     }
+    
     let utxo_set = storage.lock().unwrap().load_utxo_set().unwrap_or_else(|_| UtxoSet::new());
-    if !utxo_set.is_empty() && utxo_set.total_supply() > 0 {
+    
+    // Проверка целостности: если UTXO не соответствует количеству блоков — перестроить
+    if utxo_set.total_supply() == 0 || utxo_set.len() < max_height as usize {
+        tracing::info!("UTXO mismatch: supply={}, utxos={}, blocks={}. Rebuilding...",
+            utxo_set.total_supply(), utxo_set.len(), max_height);
+        let mut temp_val = Validator::new(b"aevum_genesis_seed");
+        for h in 0..=max_height {
+            if let Ok(Some(mut block)) = storage.lock().unwrap().load_genesis_block(h) {
+                temp_val.validate_and_apply(&mut block).ok();
+            }
+        }
+        validator.load_utxo_set(temp_val.utxo_set().clone());
+        if let Some(lb) = storage.lock().unwrap().load_genesis_block(max_height)? {
+            validator.set_last_block(lb.block_hash, lb.height, lb.poh_tick_end);
+        }
+        validator.last_poh_tick_end = validator.poh().current_tick_number();
+        tracing::info!("UTXO rebuilt: supply={}, utxos={}", validator.utxo_set().total_supply(), validator.utxo_set().len());
+    } else if !utxo_set.is_empty() {
         validator.load_utxo_set(utxo_set);
         validator.genesis_applied = true;
         if let Some(lb) = storage.lock().unwrap().load_genesis_block(max_height)? {
             validator.set_last_block(lb.block_hash, lb.height, lb.poh_tick_end);
-        validator.last_poh_tick_end = validator.poh().current_tick_number();
         }
-    } else {
-        // Перестройка UTXO из блоков
-        tracing::info!("Rebuilding UTXO from blocks...");
-        let mut new_utxo = UtxoSet::new();
-        let mut temp_val = Validator::new(b"aevum_genesis_seed");
-        for h in 0..=max_height {
-            if let Ok(Some(mut block)) = storage.lock().unwrap().load_genesis_block(h) {
-                if temp_val.validate_and_apply(&mut block).is_ok() {
-                    tracing::info!("Rebuilt block {}", h);
-                }
-            }
-        }
-        new_utxo = temp_val.utxo_set().clone();
-        validator.load_utxo_set(new_utxo);
-        validator.genesis_applied = true;
-        if let Some(lb) = storage.lock().unwrap().load_genesis_block(max_height)? {
-        validator.last_poh_tick_end = validator.poh().current_tick_number();
-            validator.set_last_block(lb.block_hash, lb.height, lb.poh_tick_end);
-        }
-        tracing::info!("UTXO rebuilt: supply={}", validator.utxo_set().total_supply());
-        validator.last_poh_tick_end = validator.poh().current_tick_number();
-        tracing::info!("PoH reset to {}", validator.last_poh_tick_end);
+    } else if let Some(gb) = storage.lock().unwrap().load_genesis_block(0)? {
+        let mut gb = gb; validator.validate_and_apply(&mut gb)?;
     }
 
     let validator = Arc::new(StdMutex::new(validator));
@@ -143,8 +139,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let peers = Arc::new(PeersManager::new(our_key.clone()));
     let tofu = Arc::new(StdMutex::new(TofuStore::new()));
-    let peer_scoring = Arc::new(StdMutex::new(PeerScoring::new()));
-    let addr_manager = Arc::new(StdMutex::new(AddrManager::new(10000)));
     let dht = Arc::new(StdMutex::new(aevum_node::p2p::dht::Dht::new(blake3::hash(&miner_pubkey.to_bytes()).into())));
     let replication = Arc::new(StdMutex::new(EncryptedReplication::new(Some(our_key.clone()), 1000)));
     let orchestrator = Arc::new(StdMutex::new(ChainOrchestrator::recover(&storage.lock().unwrap())));
@@ -171,7 +165,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).thread_name("aevum-atp").enable_all().build().unwrap();
         rt.block_on(async move {
             let listener = match TcpListener::bind(&server_listen_addr).await { Ok(l) => l, Err(e) => { tracing::error!("Bind: {}", e); return; } };
-            tracing::info!("ATP on {}", server_listen_addr);
             if !bootstrap_peers.is_empty() {
                 let dp = atp_peers.clone(); let dc = atp_ctx.clone(); let dk = atp_key.clone(); let dt = atp_tofu.clone(); let ds = atp_shutdown.clone();
                 tokio::spawn(async move {
@@ -183,7 +176,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if retry > 0 { tokio::time::sleep(Duration::from_secs(5 * (retry + 1) as u64)).await; }
                                 match aevum_node::p2p::peers::dial_peer(addr, dk.clone(), &dt).await {
                                     Ok((cipher, peer_id, reader, writer)) => {
-                                        tracing::info!("ATP CONNECTED {}", hex::encode(&peer_id));
                                         let conn = AtpConnection::new(cipher, peer_id, addr, dp.clone(), dc.clone(), false);
                                         let conn_handle = tokio::spawn(async move { conn.run(reader, writer).await; });
                                         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -205,7 +197,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tokio::spawn(async move {
                             match aevum_node::p2p::peers::accept_connection(stream, kc, &tc).await {
                                 Ok((cipher, peer_id, remote_addr, reader, writer)) => {
-                                    tracing::info!("ATP Accepted {}", hex::encode(&peer_id));
                                     AtpConnection::new(cipher, peer_id, remote_addr, pc, cc, true).run(reader, writer).await;
                                 }
                                 Err(e) => tracing::warn!("Accept failed: {}", e),
@@ -224,7 +215,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mempool_http = mempool.clone(); let validator_http = validator.clone(); let peers_http = peers.clone();
     let shutdown_http = shutdown.clone(); let start_time = Instant::now();
     std::thread::spawn(move || {
-        let server = match tiny_http::Server::http(&format!("0.0.0.0:{}", http_port)) { Ok(s) => s, Err(e) => { tracing::error!("HTTP: {}", e); return; } };
+        let server = match tiny_http::Server::http(&format!("0.0.0.0:{}", http_port)) { Ok(s) => s, Err(_) => return };
         while !shutdown_http.load(Ordering::SeqCst) {
             if let Ok(Some(mut req)) = server.recv_timeout(Duration::from_secs(1)) {
                 match (req.url(), req.method()) {
@@ -233,8 +224,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let val = validator_http.lock().unwrap();
                         let s = format!("{{\"height\":{},\"peers\":{},\"mempool\":{},\"utxos\":{},\"poh_tick\":{},\"supply\":{},\"uptime_sec\":{}}}",
                             val.last_block_height(), peers_http.peer_count(), mempool_http.lock().unwrap().len(),
-                            val.utxo_set().len(), val.poh().current_tick_number(), val.utxo_set().total_supply(),
-                            start_time.elapsed().as_secs());
+                            val.utxo_set().len(), val.poh().current_tick_number(), val.utxo_set().total_supply(), start_time.elapsed().as_secs());
                         req.respond(cors_response(&s)).ok();
                     }
                     _ => { req.respond(Response::from_string("404").with_status_code(StatusCode(404))).ok(); }
@@ -248,10 +238,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let vm = validator.clone(); let mm = mempool.clone(); let sm = storage.clone();
         let dam = developer_address; let sc = serial_counter.clone(); let shm = shutdown.clone(); let pm = peers.clone(); let s_m = sync_ctx.clone();
         std::thread::spawn(move || {
-            tracing::info!("Mining started");
             while !shm.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_secs(1));
-                
                 let mut val = vm.lock().unwrap();
                 let mut mem = mm.lock().unwrap();
                 val.tick_poh();
@@ -261,11 +249,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let should_mine = poh % target_ticks == 0 || !mem.is_empty();
                 let txs_backup = if should_mine { mem.take_batch(100) } else { vec![] };
                 let height = val.last_block_height() + 1;
-                drop(mem);
-                drop(val);
+                drop(mem); drop(val);
                 
                 if should_mine {
-                    tracing::info!("MINING: poh={}, height={}, mem={}", poh, height, txs_backup.len());
                     let mut val = vm.lock().unwrap();
                     let mut st = sm.lock().unwrap();
                     let mut txs = txs_backup.clone();
@@ -277,34 +263,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let coinbase = Economics::create_coinbase(&mk.public_key(), height, total_fees, &dam, *serial, poh);
                     drop(serial);
                     txs.insert(0, coinbase);
-                    
-                    let supply = val.utxo_set().total_supply();
-                    tracing::info!("MINING: supply={}, reward={}", supply, Economics::block_reward_satoshi(height));
-                    
                     let mut block = Block::new(val.last_block_hash(), height, poh, poh + TICKS_PER_BLOCK, txs,
                         val.utxo_set().get_state_root(),
-                        supply + Economics::block_reward_satoshi(height) + total_fees, None);
-                    
-                    match val.validate_and_apply(&mut block) {
-                        Ok(_) => {
-                            st.save_genesis_block(&block).ok();
-                            st.save_utxo_set(val.utxo_set()).ok();
-                            let _ = bincode::serialize(&val.poh_snapshot()).ok().and_then(|s| st.save_metadata(POH_SNAPSHOT_KEY, &s).ok());
-                            tracing::info!("BLOCK MINED: height={}", height);
-                            drop(val); drop(st);
-                            if let Ok(mut orch) = s_m.orchestrator.lock() {
-                                let mut v = vm.lock().unwrap(); let mut s = sm.lock().unwrap();
-                                let _ = orch.process_chain(&mut v, &mut s, &s_m, &pm);
-                            }
-                            let status = create_status(&s_m);
-                            if let Ok(data) = bincode::serialize(&status) { pm.broadcast(data); }
+                        val.utxo_set().total_supply() + Economics::block_reward_satoshi(height) + total_fees, None);
+                    if val.validate_and_apply(&mut block).is_ok() {
+                        st.save_genesis_block(&block).ok();
+                        st.save_utxo_set(val.utxo_set()).ok();
+                        let _ = bincode::serialize(&val.poh_snapshot()).ok().and_then(|s| st.save_metadata(POH_SNAPSHOT_KEY, &s).ok());
+                        tracing::info!("BLOCK MINED: height={}", height);
+                        drop(val); drop(st);
+                        if let Ok(mut orch) = s_m.orchestrator.lock() {
+                            let mut v = vm.lock().unwrap(); let mut s = sm.lock().unwrap();
+                            let _ = orch.process_chain(&mut v, &mut s, &s_m, &pm);
                         }
-                        Err(e) => {
-                            tracing::warn!("BLOCK FAILED: {} — {:?}", height, e);
-                            drop(val); drop(st);
-                            let mut mem = mm.lock().unwrap();
-                            for tx in txs_backup { mem.insert(tx).ok(); }
-                        }
+                        let status = create_status(&s_m);
+                        if let Ok(data) = bincode::serialize(&status) { pm.broadcast(data); }
+                    } else {
+                        drop(val); drop(st);
+                        let mut mem = mm.lock().unwrap();
+                        for tx in txs_backup { mem.insert(tx).ok(); }
                     }
                 }
             }
@@ -317,13 +294,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         while !shutdown_hb.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_secs(30));
             let h = hb_ctx.validator.lock().unwrap().last_block_height();
-            tracing::info!("Heartbeat: height={}, peers={}", h, hb_peers.peer_count());
             let status = create_status(&hb_ctx);
             if let Ok(data) = bincode::serialize(&status) { hb_peers.broadcast(data); }
         }
     });
 
-    tracing::info!("Aevum Node v0.4.0");
     while !shutdown.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_secs(1)); }
     Ok(())
 }

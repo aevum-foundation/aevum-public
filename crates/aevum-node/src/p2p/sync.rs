@@ -1,4 +1,5 @@
 use aevum::consensus::validator::Validator;
+const MAX_BLOCKS_PER_REQUEST: u64 = 500;
 use aevum::core::block::Block;
 use aevum::crypto::hash::Hash;
 use crate::p2p::peers::PeersManager;
@@ -63,7 +64,8 @@ pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8
             if height > my {
                 let from = if my == 0 { 1 } else { my + 1 };
                 tracing::info!("[SYNC] Requesting headers {}-{}", from, height);
-                let req = AtpMessage::HeaderRequest { from, to: height };
+                let to = height.min(from + MAX_BLOCKS_PER_REQUEST - 1);
+                let req = AtpMessage::HeaderRequest { from, to };
                 if let Ok(data) = bincode::serialize(&req) { 
                     let sent = peers.send_to(peer_id, data);
                     tracing::info!("[SYNC] HeaderRequest sent={}", sent);
@@ -92,7 +94,7 @@ pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8
             tracing::info!("[SYNC] HeaderResponse: {} headers", headers.len());
             if !headers.is_empty() {
                 let from = ctx.validator.lock().unwrap().last_block_height() + 1;
-                let to = headers.iter().map(|h| h.height).max().unwrap();
+                let to = headers.iter().map(|h| h.height).max().unwrap().min(from + MAX_BLOCKS_PER_REQUEST - 1);
                 tracing::info!("[SYNC] Requesting blocks {}-{}", from, to);
                 let req = AtpMessage::BlockRequest { request_id: rand::random(), from, to };
                 if let Ok(data) = bincode::serialize(&req) { peers.send_to(peer_id, data); }
