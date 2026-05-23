@@ -24,12 +24,9 @@ pub enum AtpMessage {
     Transaction { tx_hash: [u8; 32], ttl: u8, bytes: Vec<u8> },
     BlobRequest { blob_hashes: Vec<[u8; 32]> },
     BlobResponse { blobs: Vec<crate::encrypted_replication::EncryptedBlob> },
-    GetPeers { count: u8 },
-    PeerList { addrs: Vec<([u8; 16], u16)> },
-    ReadySignal,
-    FindNode { target_id: [u8; 32], count: u8 },
-    NodeList { nodes: Vec<([u8; 32], String)> },
-    Ping { nonce: u64 }, Pong { nonce: u64 },
+    GetPeers { count: u8 }, PeerList { addrs: Vec<([u8; 16], u16)> },
+    ReadySignal, FindNode { target_id: [u8; 32], count: u8 },
+    NodeList { nodes: Vec<([u8; 32], String)> }, Ping { nonce: u64 }, Pong { nonce: u64 },
 }
 
 pub struct SyncContext {
@@ -46,13 +43,7 @@ pub struct SyncContext {
 pub fn create_status(ctx: &SyncContext) -> AtpMessage {
     let val = ctx.validator.lock().unwrap();
     let utxo = val.utxo_set();
-    AtpMessage::Status {
-        height: val.last_block_height(),
-        poh_tick: val.poh().current_tick_number(),
-        state_root: utxo.get_state_root().0,
-        total_supply: utxo.total_supply(),
-        version: 1, capabilities: 0x01,
-    }
+    AtpMessage::Status { height: val.last_block_height(), poh_tick: val.poh().current_tick_number(), state_root: utxo.get_state_root().0, total_supply: utxo.total_supply(), version: 1, capabilities: 0x01 }
 }
 
 pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8; 20], peers: &Arc<PeersManager>) {
@@ -62,8 +53,7 @@ pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8
             let my = ctx.validator.lock().unwrap().last_block_height();
             if height > my {
                 let from = if my == 0 { 1 } else { my + 1 };
-                let to = height.min(from + 499);
-                let req = AtpMessage::HeaderRequest { from, to };
+                let req = AtpMessage::HeaderRequest { from, to: height };
                 if let Ok(data) = bincode::serialize(&req) { peers.send_to(peer_id, data); }
             }
         }
@@ -72,11 +62,7 @@ pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8
             let mut headers = Vec::new();
             for h in from..=to {
                 if let Ok(Some(block)) = st.load_genesis_block(h) {
-                    headers.push(BlockHeader {
-                        height: block.height, block_hash: block.block_hash.0, prev_hash: block.prev_hash.0,
-                        poh_tick_start: block.poh_tick_start, poh_tick_end: block.poh_tick_end,
-                        state_root: block.state_root.0, total_supply: block.total_supply,
-                    });
+                    headers.push(BlockHeader { height: block.height, block_hash: block.block_hash.0, prev_hash: block.prev_hash.0, poh_tick_start: block.poh_tick_start, poh_tick_end: block.poh_tick_end, state_root: block.state_root.0, total_supply: block.total_supply });
                 }
             }
             let resp = AtpMessage::HeaderResponse { headers };
@@ -106,68 +92,72 @@ pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8
             if let Some((last_h, _)) = blocks.last() {
                 let mut nh = ctx.network_height.lock().unwrap(); if *last_h > *nh { *nh = *last_h; }
             }
+            // Сохраняем ВСЕ блоки в БД
+            let mut st = ctx.storage.lock().unwrap();
+            for (h, bytes) in &blocks {
+                if let Ok(block) = bincode::deserialize::<Block>(bytes) {
+                    st.save_genesis_block(&block).ok();
+                }
+            }
+            drop(st);
+            // Все блоки в буфер
             let mut buffer = ctx.block_buffer.lock().unwrap();
             for (height, bytes) in blocks { buffer.insert(height, bytes); }
             drop(buffer);
-            flush_block_buffer(ctx, peers);
+            flush_block_buffer(ctx);
         }
         AtpMessage::Ping { nonce } => { let pong = AtpMessage::Pong { nonce }; if let Ok(data) = bincode::serialize(&pong) { peers.send_to(peer_id, data); } }
-        AtpMessage::GetPeers { count } => {
-            let msg = crate::p2p::pex::PeerExchange::create_peer_list(peers, count as usize);
-            if let Ok(data) = bincode::serialize(&msg) { peers.send_to(peer_id, data); }
-        }
-        AtpMessage::PeerList { addrs } => {
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-            crate::p2p::pex::PeerExchange::process_peer_list(&addrs, peers, now);
-        }
         _ => {}
     }
 }
 
-fn flush_block_buffer(ctx: &SyncContext, peers: &Arc<PeersManager>) {
+pub fn flush_block_buffer(ctx: &SyncContext) {
     let mut val = ctx.validator.lock().unwrap();
+    if !val.genesis_applied { return; }
     let mut st = ctx.storage.lock().unwrap();
     let mut buffer = ctx.block_buffer.lock().unwrap();
     let our_before = val.last_block_height();
     let mut applied = 0u64;
+    let mut need_fork = false;
 
     loop {
         let next = val.last_block_height() + 1;
         if let Some(block_bytes) = buffer.remove(&next) {
             let block: Block = match bincode::deserialize(&block_bytes) { Ok(b) => b, Err(_) => continue, };
-            let height = block.height;
+            // Пропускаем если блок уже применён
+            if block.height > 0 && st.load_genesis_block(block.height).ok().flatten().is_some() && val.last_block_height() >= block.height {
+                continue;
+            }
             match val.validate_and_apply(&mut block.clone()) {
-                Ok(_) => { st.save_genesis_block(&block).ok(); st.save_utxo_set(val.utxo_set()).ok(); ctx.chain_sync.lock().unwrap().mark_received(height); applied += 1; }
+                Ok(_) => {
+                    st.save_genesis_block(&block).ok();
+                    st.save_utxo_set(val.utxo_set()).ok();
+                    val.last_block_hash = block.block_hash;
+                    applied += 1;
+                }
                 Err(e) => {
                     let err_str = format!("{:?}", e);
-                    if err_str.contains("prev_hash") {
-                        tracing::warn!("[SYNC] Fork at {} — resolve_fork", height);
-                        let mut all_blocks: Vec<(u64, Vec<u8>)> = vec![(height, block_bytes)];
-                        let keys: Vec<u64> = buffer.iter().map(|(k, _)| *k).collect();
-                        for k in keys { if let Some(v) = buffer.remove(&k) { all_blocks.push((k, v)); } }
-                        drop(val); drop(st); drop(buffer);
-                        if let Ok(mut orch) = ctx.orchestrator.lock() {
-                            let mut v = ctx.validator.lock().unwrap();
-                            let mut s = ctx.storage.lock().unwrap();
-                            match orch.resolve_fork(&mut v, &mut s, height, &all_blocks, ctx, peers) {
-                                Ok(n) => {
-                                    tracing::info!("[SYNC] Fork resolved: {} blocks", n);
-                                    if n == 0 {
-                                        let nh = *ctx.network_height.lock().unwrap();
-                                        if nh > 0 {
-                                            let req = AtpMessage::HeaderRequest { from: 1, to: nh };
-                                            if let Ok(data) = bincode::serialize(&req) { peers.broadcast(data); }
-                                        }
-                                    }
-                                }
-                                Err(e) => tracing::error!("[SYNC] resolve_fork: {}", e),
-                            }
-                        }
-                        return;
-                    } else { tracing::warn!("[SYNC] Block {} failed: {:?}", height, e); break; }
+                    if err_str.contains("prev_hash") && val.last_block_height() > 0 { need_fork = true; }
+                    break;
                 }
             }
         } else { break; }
     }
-    if applied > 0 { tracing::info!("[SYNC] Applied {} blocks, height: {} → {}", applied, our_before, val.last_block_height()); }
+
+    if applied > 0 {
+        tracing::info!("[SYNC] Applied {} blocks, height: {} → {}", applied, our_before, val.last_block_height());
+    }
+
+    drop(buffer); drop(st); drop(val);
+
+    if need_fork {
+        if let Ok(mut orch) = ctx.orchestrator.lock() {
+            let mut v = ctx.validator.lock().unwrap();
+            let mut s = ctx.storage.lock().unwrap();
+            match orch.resolve_fork(&mut v, &mut s) {
+                Ok(saved) => tracing::info!("[SYNC] Fork resolved: {} blocks saved", saved),
+                Err(e) => tracing::error!("[SYNC] Fork resolution failed: {}", e),
+            }
+        }
+    }
 }

@@ -11,10 +11,11 @@ use aevum_node::mempool::Mempool;
 use aevum_node::storage::Storage;
 use aevum_node::sync::ChainSync;
 use aevum_node::p2p::peers::PeersManager;
-use aevum_node::p2p::sync::{AtpMessage, SyncContext, create_status, handle_atp_message};
+use aevum_node::p2p::sync::{AtpMessage, SyncContext, create_status, handle_atp_message, flush_block_buffer};
 use aevum_node::p2p::noise::{AtpCipher, TofuStore};
 use aevum_node::p2p::connection::AtpConnection;
 use aevum_node::p2p::pex::PeerExchange;
+use aevum_node::p2p::dht::Dht;
 use aevum_node::p2p::snapshots::SnapshotManager;
 use aevum_node::encrypted_replication::EncryptedReplication;
 use aevum_node::p2p::chain_orchestrator::ChainOrchestrator;
@@ -27,6 +28,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc as tokio_mpsc;
 use tiny_http::{Response, Method, Header, StatusCode};
 
 const POH_SNAPSHOT_KEY: &str = "poh_snapshot";
@@ -34,6 +36,8 @@ const SERIAL_COUNTER_KEY: &str = "serial_counter";
 const TICKS_PER_BLOCK: u64 = 30;
 const GENESIS_ADDRESS: &str = "0ffc25780ab973a85612aad6f0b7abb35bd3fd2222387de0364fd522f79c36e3";
 const GENESIS_AMOUNT: u64 = 21_000_000 * 100_000_000;
+const MIN_PEERS: usize = 2;
+const PEER_DISCOVERY_INTERVAL: u64 = 15;
 
 fn create_genesis_block() -> Block {
     let addr_bytes = hex::decode(GENESIS_ADDRESS).expect("Invalid genesis address");
@@ -46,7 +50,7 @@ fn create_genesis_block() -> Block {
 }
 
 #[derive(Parser)]
-#[command(name = "aevum-node", version = "0.5.0")]
+#[command(name = "aevum-node", version = "0.6.0")]
 struct Cli {
     #[arg(long, default_value = "0.0.0.0:9733")] listen_addr: String,
     #[arg(long, default_value = "")] bootstrap_peers: String,
@@ -55,6 +59,7 @@ struct Cli {
     #[arg(long)] miner_key_file: Option<PathBuf>,
     #[arg(long, default_value = "0ffc25780ab973a85612aad6f0b7abb35bd3fd2222387de0364fd522f79c36e3")] developer_address: String,
     #[arg(long, default_value = "19734")] http_port: u16,
+    #[arg(long)] bootstrap_mode: bool,
 }
 
 fn load_miner_key(cli: &Cli) -> Result<Option<PrivateKey>, String> {
@@ -80,6 +85,14 @@ fn cors_response(body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     resp
 }
 
+struct ConnectCommand {
+    addr: SocketAddr,
+    our_key: PrivateKey,
+    tofu: Arc<StdMutex<TofuStore>>,
+    peers: Arc<PeersManager>,
+    ctx: Arc<SyncContext>,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
@@ -88,29 +101,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let storage = Arc::new(StdMutex::new(Storage::open(&cli.db_path)?.with_encryption(&miner_pubkey.to_bytes())));
 
+    // Генезис: создаём только если bootstrap_mode ИЛИ БД пустая
     {
         let mut st = storage.lock().unwrap();
         if st.max_genesis_height()?.is_none() {
-        } else {
-            let builtin = create_genesis_block();
-            if let Ok(Some(existing)) = st.load_genesis_block(0) {
-                if existing.block_hash != builtin.block_hash {
-                    tracing::warn!("Genesis mismatch! Auto-migrating to built-in genesis...");
-                    let max_h = st.max_genesis_height()?.unwrap_or(0);
-                    for h in 1..=max_h {
-                        if let Ok(Some(block)) = st.load_genesis_block(h) {
-                            st.save_my_block(h, &block).ok();
-                            st.delete_genesis_block(h).ok();
-                        }
-                    }
-                    st.delete_genesis_block(0).ok();
-                    st.save_genesis_block(&builtin)?;
-                    tracing::info!("Genesis migrated. Old blocks saved to my_blocks.");
-                }
+            if cli.bootstrap_mode {
+                let genesis = create_genesis_block();
+                st.save_genesis_block(&genesis)?;
+                tracing::info!("[GENESIS] Bootstrap genesis created: hash={}", genesis.block_hash.to_hex());
+            } else {
+                tracing::info!("[GENESIS] No genesis yet — will download from peers");
             }
-            let genesis = create_genesis_block();
-            st.save_genesis_block(&genesis)?;
-            tracing::info!("Genesis created: hash={}", genesis.block_hash.to_hex());
         }
     }
 
@@ -127,8 +128,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     
     let utxo_set = storage.lock().unwrap().load_utxo_set().unwrap_or_else(|_| UtxoSet::new());
-    
-    if utxo_set.is_empty() {
+    if utxo_set.is_empty() && max_height > 0 {
         let mut temp_val = Validator::new(b"aevum_genesis_seed");
         for h in 0..=max_height {
             if let Ok(Some(mut block)) = storage.lock().unwrap().load_genesis_block(h) {
@@ -140,17 +140,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(lb) = storage.lock().unwrap().load_genesis_block(max_height)? {
             validator.set_last_block(lb.block_hash, lb.height, lb.poh_tick_end);
         }
-        validator.last_poh_tick_end = validator.poh().current_tick_number();
-    } else {
+    } else if !utxo_set.is_empty() {
         validator.load_utxo_set(utxo_set);
         validator.genesis_applied = true;
         if let Some(lb) = storage.lock().unwrap().load_genesis_block(max_height)? {
             validator.set_last_block(lb.block_hash, lb.height, lb.poh_tick_end);
         }
-        if validator.utxo_set().total_supply() == 0 {
+        if validator.utxo_set().total_supply() == 0 && max_height > 0 {
             if let Ok(Some(lb)) = storage.lock().unwrap().load_genesis_block(max_height) {
                 validator.utxo_set_mut().set_total_supply(lb.total_supply);
-                validator.last_poh_tick_end = validator.poh().current_tick_number();
             }
         }
     }
@@ -166,10 +164,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let peers = Arc::new(PeersManager::new(our_key.clone()));
     let tofu = Arc::new(StdMutex::new(TofuStore::new()));
-    let dht = Arc::new(StdMutex::new(aevum_node::p2p::dht::Dht::new(blake3::hash(&miner_pubkey.to_bytes()).into())));
+    let dht = Arc::new(StdMutex::new(Dht::new(blake3::hash(&miner_pubkey.to_bytes()).into())));
     let replication = Arc::new(StdMutex::new(EncryptedReplication::new(Some(our_key.clone()), 1000)));
     let orchestrator = Arc::new(StdMutex::new(ChainOrchestrator::recover(&storage.lock().unwrap())));
     let network_height = Arc::new(StdMutex::new(max_height));
+    let bootstrap_peers_list: Vec<String> = if cli.bootstrap_peers.is_empty() { vec![] } else { cli.bootstrap_peers.split(',').map(|s| s.trim().to_string()).collect() };
 
     let sync_ctx = Arc::new(SyncContext {
         validator: validator.clone(), storage: storage.clone(),
@@ -181,55 +180,81 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown = Arc::new(AtomicBool::new(false));
     ctrlc::set_handler({ let s = shutdown.clone(); move || { tracing::info!("Ctrl+C"); s.store(true, Ordering::SeqCst); } }).expect("Ctrl+C handler");
 
-    // ATP
+    let (connect_tx, mut connect_rx) = tokio_mpsc::unbounded_channel::<ConnectCommand>();
+
+    // ATP ПОТОК
     let server_listen_addr = cli.listen_addr.clone();
     let atp_peers = peers.clone(); let atp_ctx = sync_ctx.clone(); let atp_key = our_key.clone(); let atp_tofu = tofu.clone(); let atp_shutdown = shutdown.clone();
-    let bootstrap_peers: Vec<String> = if cli.bootstrap_peers.is_empty() { vec![] } else { cli.bootstrap_peers.split(',').map(|s| s.trim().to_string()).collect() };
+    let atp_bootstrap = bootstrap_peers_list.clone();
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).thread_name("aevum-atp").enable_all().build().unwrap();
         rt.block_on(async move {
             let listener = match TcpListener::bind(&server_listen_addr).await { Ok(l) => l, Err(e) => { tracing::error!("Bind: {}", e); return; } };
-            if !bootstrap_peers.is_empty() {
+            
+            if !atp_bootstrap.is_empty() {
                 let dp = atp_peers.clone(); let dc = atp_ctx.clone(); let dk = atp_key.clone(); let dt = atp_tofu.clone(); let ds = atp_shutdown.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_secs(3)).await;
-                    for addr_str in &bootstrap_peers {
+                    for addr_str in &atp_bootstrap {
                         if ds.load(Ordering::SeqCst) { break; }
                         if let Ok(addr) = addr_str.trim().parse::<SocketAddr>() {
                             for retry in 0..5 {
                                 if retry > 0 { tokio::time::sleep(Duration::from_secs(5 * (retry + 1) as u64)).await; }
                                 match aevum_node::p2p::peers::dial_peer(addr, dk.clone(), &dt).await {
                                     Ok((cipher, peer_id, reader, writer)) => {
+                                        tracing::info!("[ATP] ✅ Bootstrap CONNECTED to {}", addr);
                                         let conn = AtpConnection::new(cipher, peer_id, addr, dp.clone(), dc.clone(), false);
-                                        let conn_handle = tokio::spawn(async move { conn.run(reader, writer).await; });
+                                        tokio::spawn(async move { conn.run(reader, writer).await; });
                                         tokio::time::sleep(Duration::from_millis(100)).await;
                                         aevum_node::p2p::pex::PeerExchange::request_peers(&dp, &peer_id);
-                                        let _ = conn_handle.await; break;
+                                        break;
                                     }
-                                    Err(_) => {}
+                                    Err(e) => tracing::warn!("[ATP] Bootstrap dial failed {}: {}", addr, e),
                                 }
                             }
                         }
                     }
                 });
             }
+
             while !atp_shutdown.load(Ordering::SeqCst) {
-                match tokio::time::timeout(Duration::from_secs(1), listener.accept()).await {
-                    Ok(Ok((stream, addr))) => {
-                        if !atp_peers.can_accept(&addr) { continue; }
-                        let pc = atp_peers.clone(); let cc = atp_ctx.clone(); let kc = atp_key.clone(); let tc = atp_tofu.clone();
+                tokio::select! {
+                    accept_result = tokio::time::timeout(Duration::from_secs(1), listener.accept()) => {
+                        match accept_result {
+                            Ok(Ok((stream, addr))) => {
+                                if !atp_peers.can_accept(&addr) { continue; }
+                                let pc = atp_peers.clone(); let cc = atp_ctx.clone(); let kc = atp_key.clone(); let tc = atp_tofu.clone();
+                                tokio::spawn(async move {
+                                    match aevum_node::p2p::peers::accept_connection(stream, kc, &tc).await {
+                                        Ok((cipher, peer_id, remote_addr, reader, writer)) => {
+                                            tracing::info!("[ATP] ✅ ACCEPTED from {}", remote_addr);
+                                            AtpConnection::new(cipher, peer_id, remote_addr, pc, cc, true).run(reader, writer).await;
+                                        }
+                                        Err(e) => tracing::warn!("Accept failed: {}", e),
+                                    }
+                                });
+                            }
+                            Ok(Err(e)) => tracing::error!("Accept error: {}", e),
+                            Err(_) => {}
+                        }
+                    }
+                    Some(cmd) = connect_rx.recv() => {
+                        let dp = cmd.peers.clone();
+                        let dc = cmd.ctx.clone();
+                        let dk = cmd.our_key.clone();
+                        let dt = cmd.tofu.clone();
+                        let addr = cmd.addr;
                         tokio::spawn(async move {
-                            match aevum_node::p2p::peers::accept_connection(stream, kc, &tc).await {
-                                Ok((cipher, peer_id, remote_addr, reader, writer)) => {
-                                    AtpConnection::new(cipher, peer_id, remote_addr, pc, cc, true).run(reader, writer).await;
+                            match aevum_node::p2p::peers::dial_peer(addr, dk, &dt).await {
+                                Ok((cipher, peer_id, reader, writer)) => {
+                                    tracing::info!("[ATP] ✅ Reconnect CONNECTED to {}", addr);
+                                    AtpConnection::new(cipher, peer_id, addr, dp, dc, false).run(reader, writer).await;
                                 }
-                                Err(e) => tracing::warn!("Accept failed: {}", e),
+                                Err(e) => tracing::warn!("[ATP] Reconnect failed {}: {}", addr, e),
                             }
                         });
                     }
-                    Ok(Err(e)) => tracing::error!("Accept error: {}", e),
-                    Err(_) => {}
                 }
             }
         });
@@ -268,30 +293,82 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // МАЙНИНГ с заморозкой пока не синхронизирован
+    // МАЙНИНГ + АВТО-ПЕРЕПОДКЛЮЧЕНИЕ + САМОПРИМЕНЕНИЕ ГЕНЕЗИСА
     if let Some(mk) = load_miner_key(&cli)? {
         let vm = validator.clone(); let mm = mempool.clone(); let sm = storage.clone();
         let dam = developer_address; let sc = serial_counter.clone(); let shm = shutdown.clone(); let pm = peers.clone(); let s_m = sync_ctx.clone();
         let nh = network_height.clone();
+        let connect_tx = connect_tx.clone();
+        let atp_key2 = our_key.clone(); let atp_tofu2 = tofu.clone(); let atp_ctx2 = sync_ctx.clone();
+        let atp_peers2 = peers.clone(); let dht2 = dht.clone();
+        let last_discovery = Arc::new(StdMutex::new(Instant::now()));
+        let bootstrap_addrs: Vec<String> = vec!["186.246.14.202:9733".to_string(), "82.127.255.223:9733".to_string()];
+        
         std::thread::spawn(move || {
             while !shm.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_secs(1));
                 
                 let network_h = *nh.lock().unwrap();
                 let our_h = vm.lock().unwrap().last_block_height();
-                let has_peers = pm.peer_count() > 0;
+                let peer_count = pm.peer_count();
                 
-                if has_peers && our_h < network_h {
-                    continue; // Ждём синхронизации
+                // САМОПРИМЕНЕНИЕ ГЕНЕЗИСА
+                {
+                    let mut val = vm.lock().unwrap();
+                    if !val.genesis_applied {
+                        let st = sm.lock().unwrap();
+                        if let Ok(Some(genesis)) = st.load_genesis_block(0) {
+                            drop(st);
+                            let mut g = genesis.clone();
+                            if val.validate_and_apply(&mut g).is_ok() {
+                                val.last_block_hash = genesis.block_hash;
+                                tracing::info!("⛓️ Genesis self-applied: hash={}", genesis.block_hash.to_hex());
+                                drop(val);
+                                flush_block_buffer(&s_m);
+                                continue;
+                            }
+                        }
+                    }
+                    if !val.genesis_applied { continue; }
                 }
+                
+                // АВТО-ПЕРЕПОДКЛЮЧЕНИЕ
+                if peer_count < MIN_PEERS && last_discovery.lock().unwrap().elapsed().as_secs() > PEER_DISCOVERY_INTERVAL {
+                    *last_discovery.lock().unwrap() = Instant::now();
+                    
+                    for entry in pm.known_addresses.iter() {
+                        let addr = *entry.key();
+                        if pm.can_connect_to(&addr) {
+                            pm.mark_connecting(addr);
+                            let _ = connect_tx.send(ConnectCommand { addr, our_key: atp_key2.clone(), tofu: atp_tofu2.clone(), peers: atp_peers2.clone(), ctx: atp_ctx2.clone() });
+                        }
+                    }
+                    for addr_str in &bootstrap_addrs {
+                        if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+                            if pm.can_connect_to(&addr) {
+                                pm.mark_connecting(addr);
+                                let _ = connect_tx.send(ConnectCommand { addr, our_key: atp_key2.clone(), tofu: atp_tofu2.clone(), peers: atp_peers2.clone(), ctx: atp_ctx2.clone() });
+                            }
+                        }
+                    }
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                    for node in dht2.lock().unwrap().random_nodes(8, now, 3600) {
+                        if pm.can_connect_to(&node.addr) {
+                            pm.mark_connecting(node.addr);
+                            let _ = connect_tx.send(ConnectCommand { addr: node.addr, our_key: atp_key2.clone(), tofu: atp_tofu2.clone(), peers: atp_peers2.clone(), ctx: atp_ctx2.clone() });
+                        }
+                    }
+                }
+                
+                if peer_count > 0 && our_h < network_h { continue; }
                 
                 let mut val = vm.lock().unwrap();
                 let mut mem = mm.lock().unwrap();
                 val.tick_poh();
                 let poh = val.poh().current_tick_number();
-                let active_miners = pm.peer_count().max(1) as u64;
+                let active_miners = peer_count.max(1) as u64;
                 let target_ticks = TICKS_PER_BLOCK.saturating_sub((active_miners / 10).min(TICKS_PER_BLOCK - 10));
-                let should_mine = (poh % target_ticks == 0 || !mem.is_empty()) && (pm.peer_count() == 0 || val.last_block_height() >= *nh.lock().unwrap());
+                let should_mine = (poh % target_ticks == 0 || !mem.is_empty()) && (peer_count == 0 || val.last_block_height() >= *nh.lock().unwrap());
                 let txs_backup = if should_mine { mem.take_batch(100) } else { vec![] };
                 let height = val.last_block_height() + 1;
                 drop(mem); drop(val);
@@ -301,10 +378,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut st = sm.lock().unwrap();
                     let supply = val.utxo_set().total_supply();
                     let mut txs = txs_backup.clone();
-                    let total_fees: u64 = txs.iter().map(|tx| {
-                        let a: u64 = tx.outputs.iter().map(|o| o.amount).sum();
-                        if a > 0 { Economics::calculate_fee(a).0 } else { 0 }
-                    }).sum();
+                    let total_fees: u64 = txs.iter().map(|tx| { let a: u64 = tx.outputs.iter().map(|o| o.amount).sum(); if a > 0 { Economics::calculate_fee(a).0 } else { 0 } }).sum();
                     let mut serial = sc.lock().unwrap(); *serial += 2;
                     let coinbase = Economics::create_coinbase(&mk.public_key(), height, total_fees, &dam, *serial, poh);
                     drop(serial);
@@ -320,23 +394,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             drop(val); drop(st);
                             if let Ok(mut orch) = s_m.orchestrator.lock() {
                                 let mut v = vm.lock().unwrap(); let mut s = sm.lock().unwrap();
-                                let _ = orch.process_chain(&mut v, &mut s, &s_m, &pm);
+                                let _ = orch.process_chain(&mut v, &mut s);
                             }
                             let status = create_status(&s_m);
                             if let Ok(data) = bincode::serialize(&status) { pm.broadcast(data); }
+                            tracing::info!("⛏️  Mined block {}", height);
                         }
-                        Err(e) => {
-                            drop(val); drop(st);
-                            let mut mem = mm.lock().unwrap();
-                            for tx in txs_backup { mem.insert(tx).ok(); }
-                        }
+                        Err(_) => { drop(val); drop(st); let mut mem = mm.lock().unwrap(); for tx in txs_backup { mem.insert(tx).ok(); } }
                     }
                 }
             }
         });
     }
 
-    // Heartbeat
     let hb_ctx = sync_ctx.clone(); let hb_peers = peers.clone(); let shutdown_hb = shutdown.clone();
     std::thread::spawn(move || {
         while !shutdown_hb.load(Ordering::SeqCst) {

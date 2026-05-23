@@ -40,7 +40,6 @@ impl AtpConnection {
         let send_cipher = Arc::new(TokioMutex::new(cipher));
         let recv_secret = send_cipher.try_lock().unwrap().shared_secret_bytes();
         let recv_cipher = Arc::new(TokioMutex::new(AtpCipher::new(&recv_secret)));
-        tracing::info!("[ATP] new() is_server={}", is_server);
         Self { peer_id, addr, is_server, peers, ctx, state: ConnState::Handshaking,
             stats: PeerStats { connected_at: Some(Instant::now()), ..Default::default() },
             send_cipher, recv_cipher, pending_outgoing: Vec::new(), outgoing_tx: None,
@@ -54,11 +53,12 @@ impl AtpConnection {
         if let Ok(data) = bincode::serialize(&status) { self.pending_outgoing.push(data); }
         let pex_msg = PeerExchange::create_peer_list(&self.peers, 20);
         if let Ok(data) = bincode::serialize(&pex_msg) { self.pending_outgoing.push(data); }
-        if self.peer_height > our_height {
-            let from = if our_height == 0 { 1 } else { our_height + 1 };
-            tracing::info!("[ATP] start_sync: requesting headers {}-{}", from, self.peer_height);
-            let to = self.peer_height.min(from + 499);
-            let req = AtpMessage::HeaderRequest { from, to };
+        if our_height == 0 {
+            let req = AtpMessage::HeaderRequest { from: 0, to: self.peer_height.min(499) };
+            if let Ok(data) = bincode::serialize(&req) { self.pending_outgoing.push(data); }
+        } else if self.peer_height > our_height {
+            let from = our_height + 1;
+            let req = AtpMessage::HeaderRequest { from, to: self.peer_height };
             if let Ok(data) = bincode::serialize(&req) { self.pending_outgoing.push(data); }
         }
         let dht = &self.ctx.dht;
@@ -71,19 +71,15 @@ impl AtpConnection {
     }
 
     fn flush(&mut self) {
-        let count = self.pending_outgoing.len();
-        tracing::info!("[ATP] flush: {} messages", count);
         if let Some(ref tx) = self.outgoing_tx {
             for data in self.pending_outgoing.drain(..) { let _ = tx.try_send(data); }
-        } else { tracing::warn!("[ATP] flush: NO outgoing_tx!"); }
+        }
     }
 
     pub async fn run(mut self, mut reader: ReadHalf<TcpStream>, mut writer: WriteHalf<TcpStream>) {
-        tracing::info!("[ATP] run() START is_server={}", self.is_server);
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
         self.outgoing_tx = Some(tx.clone());
         self.peers.register_peer(self.peer_id, self.addr, self.outgoing_tx.as_ref().unwrap().clone());
-        tracing::info!("[ATP] run() channel registered, peer_id={}", hex::encode(&self.peer_id));
 
         let send_cipher = self.send_cipher.clone();
         let recv_cipher = self.recv_cipher.clone();
@@ -92,41 +88,32 @@ impl AtpConnection {
         let peer_id = self.peer_id;
 
         if self.is_server {
-            tracing::info!("[ATP] SERVER: waiting for client status...");
             match Self::read_msg(&mut reader).await {
                 Ok(encrypted) => {
-                    tracing::info!("[ATP] SERVER: received {} bytes", encrypted.len());
                     if let Some(p) = recv_cipher.lock().await.decrypt(&encrypted) {
                         if let Ok(msg) = bincode::deserialize::<AtpMessage>(&p) {
-                            tracing::info!("[ATP] SERVER: got {:?}", std::mem::discriminant(&msg));
-                            if let AtpMessage::Status { height, .. } = &msg { self.peer_height = *height; tracing::info!("[ATP] SERVER: peer_height={}", height); }
+                            if let AtpMessage::Status { height, .. } = &msg { self.peer_height = *height; }
                             let ctx_h = ctx.clone(); let peers_h = peers.clone(); let pid = peer_id;
-                            tokio::spawn(async move { tracing::info!("[ATP] SERVER: spawning handle_atp_message"); handle_atp_message(msg, &ctx_h, &pid, &peers_h); });
-                        } else { tracing::warn!("[ATP] SERVER: deserialize FAILED"); }
-                    } else { tracing::warn!("[ATP] SERVER: decrypt FAILED"); }
+                            tokio::spawn(async move { handle_atp_message(msg, &ctx_h, &pid, &peers_h); });
+                        }
+                    }
                 }
-                Err(e) => { tracing::warn!("[ATP] SERVER: read_msg FAILED: {}", e); return; }
+                Err(_) => return,
             }
-            tracing::info!("[ATP] SERVER: sending status");
             Self::send_status(&send_cipher, &ctx, &mut writer, &peer_id).await;
-            tracing::info!("[ATP] SERVER: status sent");
         } else {
-            tracing::info!("[ATP] CLIENT: sending status");
             Self::send_status(&send_cipher, &ctx, &mut writer, &peer_id).await;
-            tracing::info!("[ATP] CLIENT: status sent, waiting for server status...");
             match Self::read_msg(&mut reader).await {
                 Ok(encrypted) => {
-                    tracing::info!("[ATP] CLIENT: received {} bytes", encrypted.len());
                     if let Some(p) = recv_cipher.lock().await.decrypt(&encrypted) {
                         if let Ok(msg) = bincode::deserialize::<AtpMessage>(&p) {
-                            tracing::info!("[ATP] CLIENT: got {:?}", std::mem::discriminant(&msg));
-                            if let AtpMessage::Status { height, .. } = &msg { self.peer_height = *height; tracing::info!("[ATP] CLIENT: peer_height={}", height); }
+                            if let AtpMessage::Status { height, .. } = &msg { self.peer_height = *height; }
                             let ctx_h = ctx.clone(); let peers_h = peers.clone(); let pid = peer_id;
-                            tokio::spawn(async move { tracing::info!("[ATP] CLIENT: spawning handle_atp_message"); handle_atp_message(msg, &ctx_h, &pid, &peers_h); });
-                        } else { tracing::warn!("[ATP] CLIENT: deserialize FAILED"); }
-                    } else { tracing::warn!("[ATP] CLIENT: decrypt FAILED"); }
+                            tokio::spawn(async move { handle_atp_message(msg, &ctx_h, &pid, &peers_h); });
+                        }
+                    }
                 }
-                Err(e) => { tracing::warn!("[ATP] CLIENT: read_msg FAILED: {}", e); return; }
+                Err(_) => return,
             }
         }
 
@@ -135,8 +122,6 @@ impl AtpConnection {
         self.state = ConnState::Active;
 
         let writer = Arc::new(TokioMutex::new(writer));
-        tracing::info!("[ATP] Entering active loop");
-
         let kp_writer = writer.clone();
         let kp_send = send_cipher.clone();
         let keepalive_handle = tokio::spawn(async move {
@@ -169,7 +154,6 @@ impl AtpConnection {
         loop {
             tokio::select! {
                 data = rx.recv() => {
-                    tracing::info!("[ATP] select! rx.recv() woke up");
                     match data {
                         Some(d) => {
                             let encrypted = send_cipher.lock().await.encrypt(&d);
@@ -184,31 +168,20 @@ impl AtpConnection {
                     }
                 }
                 result = Self::read_msg(&mut reader) => {
-                    tracing::info!("[ATP] select! read_msg() woke up");
                     match result {
                         Ok(encrypted) => {
                             self.last_alive = Instant::now();
                             if let Some(p) = recv_cipher.lock().await.decrypt(&encrypted) {
                                 if let Ok(msg) = bincode::deserialize::<AtpMessage>(&p) {
-                                    let disc = std::mem::discriminant(&msg);
-                                    tracing::info!("[ATP] active loop got {:?}", disc);
-                                    if let AtpMessage::Status { height, .. } = &msg { self.peer_height = *height; tracing::info!("[ATP] Status update: peer_height={}", height); }
-                                    if let AtpMessage::BlockResponse { blocks, .. } = &msg { tracing::info!("[ATP] BlockResponse: {} blocks", blocks.len()); }
-                                    if let AtpMessage::HeaderResponse { headers } = &msg { tracing::info!("[ATP] HeaderResponse: {} headers", headers.len()); }
                                     if let AtpMessage::Pong { .. } = &msg { continue; }
                                     if let AtpMessage::Ping { nonce } = &msg {
                                         let pong = AtpMessage::Pong { nonce: *nonce };
                                         if let Ok(data) = bincode::serialize(&pong) { let _ = tx.try_send(data); }
                                         continue;
                                     }
-                                    if let AtpMessage::PeerList { ref addrs } = msg {
-                                        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-                                        PeerExchange::process_peer_list(addrs, &peers, now);
-                                    }
-                                    tracing::info!("[ATP] calling handle_atp_message for {:?}", disc);
                                     handle_atp_message(msg, &ctx, &peer_id, &peers);
-                                } else { tracing::warn!("[ATP] deserialize FAILED in active loop"); }
-                            } else { tracing::warn!("[ATP] decrypt FAILED in active loop"); }
+                                }
+                            }
                         }
                         Err(_) => break,
                     }
@@ -218,7 +191,6 @@ impl AtpConnection {
         keepalive_handle.abort();
         sync_handle.abort();
         self.peers.remove_peer(&peer_id);
-        tracing::info!("[ATP] Disconnected: {}", hex::encode(&peer_id));
     }
 
     async fn send_status(send_cipher: &Arc<TokioMutex<AtpCipher>>, ctx: &Arc<SyncContext>, writer: &mut WriteHalf<TcpStream>, _peer_id: &[u8; 20]) {

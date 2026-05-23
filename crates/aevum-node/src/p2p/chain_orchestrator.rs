@@ -4,27 +4,22 @@ use aevum::core::jt_utxo::JtUtxo;
 use aevum::crypto::hash::Hash;
 use aevum::crypto::keys::PublicKey;
 use crate::p2p::peers::PeersManager;
-use crate::p2p::sync::{AtpMessage, SyncContext};
+use crate::p2p::sync::SyncContext;
 use crate::storage::Storage;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const MIN_CONFIRMATIONS: u64 = 6;
 const CHECKPOINT_INTERVAL: u64 = 1000;
 const MAX_FORK_QUEUE: usize = 16;
 const MAX_CANDIDATES_PER_PEER: usize = 2;
 const FORK_CANDIDATE_TTL: Duration = Duration::from_secs(300);
-const CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(600);
-const FORK_QUEUE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub enum OrchestratorError {
     StorageFailed { operation: String, detail: String },
     ValidationFailed { height: u64, reason: String },
     ForkQueueFull,
-    ConfirmationTimeout { pending_height: u64 },
-    LongRangeAttackDetected { checkpoint_height: u64, expected: String, got: String },
     InvalidBlock { height: u64, expected_hash: String, got_hash: String },
 }
 impl std::fmt::Display for OrchestratorError {
@@ -33,8 +28,6 @@ impl std::fmt::Display for OrchestratorError {
             OrchestratorError::StorageFailed { operation, detail } => write!(f, "Storage {}: {}", operation, detail),
             OrchestratorError::ValidationFailed { height, reason } => write!(f, "Validation at {}: {}", height, reason),
             OrchestratorError::ForkQueueFull => write!(f, "Fork queue full"),
-            OrchestratorError::ConfirmationTimeout { pending_height } => write!(f, "Timeout at {}", pending_height),
-            OrchestratorError::LongRangeAttackDetected { checkpoint_height, expected, got } => write!(f, "Long-range at {}: expected {} got {}", checkpoint_height, expected, got),
             OrchestratorError::InvalidBlock { height, expected_hash, got_hash } => write!(f, "Block {}: expected {} got {}", height, expected_hash, got_hash),
         }
     }
@@ -62,7 +55,6 @@ struct CheckpointManager;
 impl CheckpointManager {
     fn save(st: &mut Storage, h: u64, hash: Hash) -> Result<(), OrchestratorError> { st.save_metadata(&format!("cp_{}", h), &hash.0).map_err(|e| OrchestratorError::StorageFailed { operation: "cp_save".into(), detail: format!("{:?}", e) }) }
     fn get(st: &Storage, h: u64) -> Option<Hash> { st.load_metadata(&format!("cp_{}", h)).ok().flatten().and_then(|d| bincode::deserialize(&d).ok()) }
-    fn get_nearest(st: &Storage, h: u64) -> Option<(u64, Hash)> { let cp = (h / CHECKPOINT_INTERVAL) * CHECKPOINT_INTERVAL; Self::get(st, cp).map(|x| (cp, x)) }
     fn finalize(st: &Storage, h: u64) -> Result<(), OrchestratorError> { st.save_metadata("finalized_cp", &h.to_le_bytes()).map_err(|e| OrchestratorError::StorageFailed { operation: "cp_fin".into(), detail: format!("{:?}", e) }) }
 }
 
@@ -91,25 +83,25 @@ pub struct OrchestratorMetrics {
 
 pub struct ChainOrchestrator {
     wal: WriteAheadLog, fork_queue: ForkQueue,
-    pending_confirmation: Option<(u64, Vec<(u64, Vec<u8>)>, [u8; 20], Hash, Instant)>,
-    confirmation_counter: u64, pub processed_height: u64, pub metrics: OrchestratorMetrics,
+    pub processed_height: u64, pub metrics: OrchestratorMetrics,
+    last_fork_resolved_at: Option<Instant>,
 }
 
 impl ChainOrchestrator {
     pub fn new() -> Self {
-        ChainOrchestrator { wal: WriteAheadLog::new(), fork_queue: ForkQueue::new(), pending_confirmation: None, confirmation_counter: 0, processed_height: 0, metrics: OrchestratorMetrics::default() }
+        ChainOrchestrator { wal: WriteAheadLog::new(), fork_queue: ForkQueue::new(), processed_height: 0, metrics: OrchestratorMetrics::default(), last_fork_resolved_at: None }
     }
     pub fn recover(st: &Storage) -> Self {
         let wal = WriteAheadLog::recover(st);
         let processed = st.load_metadata("orch_processed_height").ok().flatten().and_then(|d| bincode::deserialize::<u64>(&d).ok()).unwrap_or(0);
-        ChainOrchestrator { wal: wal.unwrap_or_else(WriteAheadLog::new), fork_queue: ForkQueue::new(), pending_confirmation: None, confirmation_counter: 0, processed_height: processed, metrics: OrchestratorMetrics::default() }
+        ChainOrchestrator { wal: wal.unwrap_or_else(WriteAheadLog::new), fork_queue: ForkQueue::new(), processed_height: processed, metrics: OrchestratorMetrics::default(), last_fork_resolved_at: None }
     }
 
     fn save_progress(&self, st: &mut Storage) -> Result<(), OrchestratorError> {
         st.save_metadata("orch_processed_height", &bincode::serialize(&self.processed_height).unwrap_or_default()).map_err(|e| OrchestratorError::StorageFailed { operation: "save_progress".into(), detail: format!("{:?}", e) })
     }
 
-    pub fn process_chain(&mut self, val: &mut Validator, st: &mut Storage, _ctx: &SyncContext, _peers: &Arc<PeersManager>) -> Result<u64, OrchestratorError> {
+    pub fn process_chain(&mut self, val: &mut Validator, st: &mut Storage) -> Result<u64, OrchestratorError> {
         let current = val.last_block_height();
         if current <= self.processed_height { return Ok(0); }
         let mut processed = 0u64;
@@ -137,26 +129,35 @@ impl ChainOrchestrator {
     fn analyze(&mut self, block: &Block, h: u64) { let n = block.transactions.len(); let s: u64 = block.transactions.iter().flat_map(|tx| tx.outputs.iter()).map(|o| o.amount).sum(); tracing::debug!("[ORCH] Block {}: {} txs, {} AEV", h, n, s as f64 / 100_000_000.0); }
     fn distribute(&mut self, block: &Block) { for tx in &block.transactions { if tx.inputs.is_empty() { for o in &tx.outputs { self.metrics.rewards_distributed += o.amount; } } } }
 
-    // ============================================================
-    // resolve_fork — вызывается из flush_block_buffer
-    // ============================================================
-    pub fn resolve_fork(&mut self, val: &mut Validator, st: &mut Storage, fork_height: u64,
-        peer_blocks: &[(u64, Vec<u8>)], _ctx: &SyncContext, _peers: &Arc<PeersManager>) -> Result<u64, OrchestratorError>
-    {
+    pub fn resolve_fork(&mut self, val: &mut Validator, st: &mut Storage) -> Result<u64, OrchestratorError> {
+        if let Some(last) = self.last_fork_resolved_at {
+            if last.elapsed() < Duration::from_secs(30) {
+                tracing::info!("[ORCH] Fork resolution skipped (cooldown 30s)");
+                return Ok(0);
+            }
+        }
+
         let our_height = val.last_block_height();
-        self.wal.log(st, "resolve_fork", fork_height, None)?;
+        if our_height == 0 {
+            tracing::info!("[ORCH] Nothing to save, height=0");
+            self.last_fork_resolved_at = Some(Instant::now());
+            return Ok(0);
+        }
+
+        self.wal.log(st, "resolve_fork_start", our_height, None)?;
         self.metrics.forks_detected += 1;
 
         let mut refund = 0u64;
-        let mut rewards: Vec<(PublicKey, u64)> = Vec::new();
+        let mut saved = 0u64;
 
-        for h in fork_height..=our_height {
+        for h in 1..=our_height {
             if let Ok(Some(block)) = st.load_genesis_block(h) {
                 st.save_my_block(h, &block).map_err(|e| OrchestratorError::StorageFailed { operation: "save_my".into(), detail: format!("{:?}", e) })?;
                 for tx in &block.transactions {
-                    if tx.inputs.is_empty() { for o in &tx.outputs { refund += o.amount; rewards.push((o.owner.clone(), o.amount)); } }
+                    if tx.inputs.is_empty() { for o in &tx.outputs { refund += o.amount; } }
                 }
                 st.delete_genesis_block(h).map_err(|e| OrchestratorError::StorageFailed { operation: "del".into(), detail: format!("{:?}", e) })?;
+                saved += 1;
             }
         }
 
@@ -167,29 +168,23 @@ impl ChainOrchestrator {
             val.set_last_block(g.block_hash, 0, g.poh_tick_end);
         }
 
-        for (miner, amt) in &rewards {
-            let utxo = JtUtxo::new_global_clean(miner.clone(), *amt, &[1u8; 32], &[1u8; 32], fork_height + 1, 0, Hash::zero());
+        // JT-UTXO возврат
+        if refund > 0 {
+            let utxo = JtUtxo::new_global_clean(
+                val.utxo_set().all().next().map(|(_, u)| u.owner().clone()).unwrap_or(aevum::crypto::keys::PublicKey::from_bytes([0u8; 32]).unwrap()),
+                refund, &[1u8; 32], &[1u8; 32], our_height + 1, 0, Hash::zero());
             if let Ok(u) = utxo { val.utxo_set_mut().add(u); }
         }
         self.metrics.total_refunded += refund;
         self.metrics.switches_performed += 1;
+        self.processed_height = 0;
+        self.last_fork_resolved_at = Some(Instant::now());
 
-        let mut applied = 0u64;
-        for (h, bytes) in peer_blocks {
-            let h = *h;
-            if h <= val.last_block_height() || h != val.last_block_height() + 1 { continue; }
-            if let Ok(block) = bincode::deserialize::<Block>(bytes) {
-                match val.validate_and_apply(&mut block.clone()) {
-                    Ok(_) => { st.save_genesis_block(&block).ok(); st.save_utxo_set(val.utxo_set()).ok(); applied += 1; }
-                    Err(_) => break,
-                }
-            }
-        }
-
-        self.processed_height = val.last_block_height();
-        self.wal.log(st, "fork_done", val.last_block_height(), None)?;
+        self.wal.log(st, "resolve_fork_done", 0, None)?;
         self.save_progress(st)?;
-        tracing::info!("[ORCH] Fork resolved: saved={}, refund={}, applied={}", rewards.len(), refund, applied);
-        Ok(applied)
+
+        tracing::info!("[ORCH] Fork resolved: saved={} blocks (1..{}), refund={} satoshi ({} AEV), height=0",
+            saved, our_height, refund, refund as f64 / 100_000_000.0);
+        Ok(saved)
     }
 }

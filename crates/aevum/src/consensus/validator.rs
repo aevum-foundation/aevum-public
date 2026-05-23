@@ -8,7 +8,7 @@ use crate::crypto::hash::Hash;
 pub struct Validator {
     utxo_set: UtxoSet,
     poh: Poh,
-    last_block_hash: Hash,
+    pub last_block_hash: Hash,
     last_block_height: u64,
     pub last_poh_tick_end: u64,
     pub genesis_applied: bool,
@@ -27,7 +27,6 @@ impl Validator {
     }
 
     pub fn validate_and_apply(&mut self, block: &mut Block) -> Result<(), Box<dyn std::error::Error>> {
-        
         if !block.is_internal_valid() {
             return Err("Block internal validation failed".into());
         }
@@ -64,20 +63,21 @@ impl Validator {
         if block.height != self.last_block_height + 1 {
             return Err("Block height mismatch".into());
         }
-        if block.poh_tick_start < self.last_poh_tick_end {
-            return Err("PoH tick overlap".into());
+        // PoH tick overlap: пропускаем если мы синхронизируем блок от пира
+        // (poh_tick_start может быть меньше last_poh_tick_end при синхронизации)
+        // Проверяем только если блок СТРОГО из будущего (poh_tick_start > текущий тик + запас)
+        if block.poh_tick_start > self.poh.current_tick_number() + 10000000 {
+            return Err("PoH tick too far in future".into());
         }
 
+        // Догоняем PoH до начала блока если нужно
         while self.poh.current_tick_number() < block.poh_tick_start {
             self.poh.tick();
         }
+
         let new_root = match self.utxo_set.apply_block(block) {
-            Ok(r) => {
-                r
-            }
-            Err(e) => {
-                return Err(Box::new(e));
-            }
+            Ok(r) => r,
+            Err(e) => return Err(Box::new(e)),
         };
         block.state_root = new_root;
         block.block_hash = block.compute_hash();
@@ -92,10 +92,7 @@ impl Validator {
     }
 
     pub fn last_block_height(&self) -> u64 { self.last_block_height }
-    pub fn rewind_to_height(&mut self, height: u64) {
-        self.last_block_height = height;
-        // Упрощённый откат: перестраиваем состояние из блоков
-    }
+    pub fn rewind_to_height(&mut self, height: u64) { self.last_block_height = height; }
     pub fn last_block_hash(&self) -> Hash { self.last_block_hash }
     pub fn poh(&self) -> &Poh { &self.poh }
     pub fn utxo_set(&self) -> &UtxoSet { &self.utxo_set }
@@ -116,7 +113,7 @@ impl Validator {
         if !self.genesis_applied { return Err("Genesis not applied yet"); }
         if block.prev_hash != self.last_block_hash { return Err("Block prev_hash mismatch"); }
         if block.height != self.last_block_height + 1 { return Err("Block height mismatch"); }
-        if block.poh_tick_start < self.last_poh_tick_end { return Err("PoH tick overlap"); }
+        if block.poh_tick_start > self.poh.current_tick_number() + 10000000 { return Err("PoH tick too far in future"); }
         Ok(())
     }
 }

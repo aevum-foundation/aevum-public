@@ -8,6 +8,9 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 const MAX_PEERS: usize = 1000;
+const MAX_OUTBOUND: usize = 8;
+const MAX_SIMULTANEOUS_CONNECTS: usize = 3;
+const MIN_RECONNECT_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_IP_CONNECTIONS: usize = 4;
 const RATE_LIMIT_PER_SEC: u64 = 100;
 const BAN_DURATION_FIRST: Duration = Duration::from_secs(60);
@@ -25,6 +28,9 @@ pub struct PeersManager {
     pub ban_list: DashMap<SocketAddr, (Instant, u32)>,
     pub our_key: PrivateKey,
     pub tofu: std::sync::Mutex<TofuStore>,
+    pub outbound_count: std::sync::atomic::AtomicUsize,
+    pub last_connect_attempt: DashMap<SocketAddr, Instant>,
+    pub connecting_count: std::sync::atomic::AtomicUsize,
 }
 
 impl PeersManager {
@@ -34,6 +40,9 @@ impl PeersManager {
             known_addresses: DashMap::new(), ip_connections: DashMap::new(),
             ban_list: DashMap::new(), our_key,
             tofu: std::sync::Mutex::new(TofuStore::new()),
+            outbound_count: std::sync::atomic::AtomicUsize::new(0),
+            last_connect_attempt: DashMap::new(),
+            connecting_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -53,8 +62,29 @@ impl PeersManager {
         self.ip_connections.get(addr).map(|e| *e).unwrap_or(0) < MAX_IP_CONNECTIONS
     }
 
+    pub fn can_connect_to(&self, addr: &SocketAddr) -> bool {
+        if self.peer_ips.iter().any(|e| *e.value() == *addr) { return false; }
+        if self.outbound_count.load(std::sync::atomic::Ordering::Relaxed) >= MAX_OUTBOUND { return false; }
+        if self.connecting_count.load(std::sync::atomic::Ordering::Relaxed) >= MAX_SIMULTANEOUS_CONNECTS { return false; }
+        if let Some(last) = self.last_connect_attempt.get(addr) {
+            if last.elapsed() < MIN_RECONNECT_INTERVAL { return false; }
+        }
+        if self.is_banned(addr) { return false; }
+        true
+    }
+
+    pub fn mark_connecting(&self, addr: SocketAddr) {
+        self.connecting_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.last_connect_attempt.insert(addr, Instant::now());
+    }
+
+    pub fn mark_connected(&self, _addr: SocketAddr) {
+        self.connecting_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.outbound_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn register_peer(&self, peer_id: [u8; 20], addr: SocketAddr, tx: mpsc::Sender<Vec<u8>>) {
-        tracing::info!("[PEERS] register_peer: {}", hex::encode(&peer_id));
+        tracing::info!("[PEERS] register_peer: {} ({})", hex::encode(&peer_id), addr);
         self.peers.insert(peer_id, PeerState { tx, addr, msg_count: 0, last_reset: Instant::now() });
         self.peer_ips.insert(peer_id, addr);
         *self.ip_connections.entry(addr).or_insert(0) += 1;
@@ -65,6 +95,7 @@ impl PeersManager {
         tracing::info!("[PEERS] remove_peer: {}", hex::encode(peer_id));
         if let Some((_, s)) = self.peers.remove(peer_id) {
             if let Some(mut c) = self.ip_connections.get_mut(&s.addr) { *c = c.saturating_sub(1); }
+            self.outbound_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
         self.peer_ips.remove(peer_id);
     }
@@ -84,23 +115,14 @@ impl PeersManager {
     }
 
     pub fn send_to(&self, peer_id: &[u8; 20], msg: Vec<u8>) -> bool {
-        tracing::info!("[PEERS] send_to: {} ({} bytes)", hex::encode(peer_id), msg.len());
         match self.peers.get_mut(peer_id) {
             Some(mut s) => {
                 if s.last_reset.elapsed() >= Duration::from_secs(1) { s.msg_count = 0; s.last_reset = Instant::now(); }
-                if s.msg_count >= RATE_LIMIT_PER_SEC {
-                    tracing::warn!("[PEERS] send_to: rate limited");
-                    return false;
-                }
+                if s.msg_count >= RATE_LIMIT_PER_SEC { return false; }
                 s.msg_count += 1;
-                let result = s.tx.try_send(msg).is_ok();
-                tracing::info!("[PEERS] send_to: try_send={}", result);
-                result
+                s.tx.try_send(msg).is_ok()
             }
-            None => {
-                tracing::warn!("[PEERS] send_to: peer {} NOT FOUND", hex::encode(peer_id));
-                false
-            }
+            None => false,
         }
     }
 
