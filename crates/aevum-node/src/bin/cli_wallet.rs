@@ -16,6 +16,8 @@ use std::collections::HashMap;
 use rand::Rng;
 use sha2::{Sha256, Digest};
 
+extern crate ureq;
+
 const FEE_PERCENT_BASIS: u64 = 10;
 const FEE_DENOMINATOR: u64 = 100_000;
 const COINBASE_MATURITY_DEFAULT: u64 = 100;
@@ -33,9 +35,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = args.iter().position(|a| a == "--db")
         .and_then(|i| args.get(i + 1)).map(PathBuf::from)
         .unwrap_or_else(|| { eprintln!("--db не указан, используется ./aevum.db"); PathBuf::from("./aevum.db") });
+    let node_url = args.iter().position(|a| a == "--node-url")
+        .and_then(|i| args.get(i + 1)).cloned();
     match args[1].as_str() {
-        "balance" => cmd_balance(&args, &db_path)?,
-        "send" => cmd_send(&args, &db_path)?,
+        "balance" => if node_url.is_some() { cmd_balance_http(&args, &node_url.unwrap())? } else { cmd_balance(&args, &db_path)? },
+        "send" => if node_url.is_some() { cmd_send_http(&args, &node_url.unwrap())? } else { cmd_send(&args, &db_path)? },
         "history" => cmd_history(&args, &db_path)?,
         "create-address" => cmd_create_address()?,
         "export-key" => cmd_export_key(&args)?,
@@ -57,9 +61,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_help() {
-    println!("Aevum CLI Wallet v0.7");
-    println!("  balance --address <АДРЕС> --db <ПУТЬ>");
-    println!("  send --from-key-file <ФАЙЛ> --to <АДРЕС> --amount <СУММА> [--dry-run] --db <ПУТЬ>");
+    println!("Aevum CLI Wallet v1.0");
+    println!("  balance --address <АДРЕС> --db <ПУТЬ> [--node-url <URL>]");
+    println!("  send --from-key-file <ФАЙЛ> --to <АДРЕС> --amount <СУММА> [--dry-run] --db <ПУТЬ> [--node-url <URL>]");
     println!("  history --address <АДРЕС> [--limit N] --db <ПУТЬ>");
     println!("  create-address");
     println!("  export-key --mnemonic '<12 слов>'");
@@ -74,7 +78,122 @@ fn print_help() {
     println!("  genesis-info --db <ПУТЬ>");
     println!("  compute-status --address <АДРЕС> --db <ПУТЬ>");
     println!("  utxos [--address <АДРЕС>] [--limit N] [--offset M] --db <ПУТЬ>");
+    println!("  Флаг --node-url позволяет работать без остановки ноды (через HTTP API)");
 }
+
+// ============================================================
+// HTTP МЕТОДЫ (без остановки ноды)
+// ============================================================
+
+fn cmd_balance_http(args: &[String], node_url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let addr = parse_hex_arg(args, "--address")?;
+    let pk = validate_public_key(&addr, "адрес")?;
+    let resp = ureq::get(&format!("{}/utxos?address={}", node_url, hex::encode(pk.to_bytes()))).call()?.into_string()?;
+    let utxos: Vec<serde_json::Value> = serde_json::from_str(&resp)?;
+    let total: u64 = utxos.iter().map(|u| u["amount"].as_u64().unwrap_or(0)).sum();
+    println!("Баланс: {:.8} AEV", total as f64 / 100_000_000.0);
+    println!("└─ UTXO: {}", utxos.len());
+    Ok(())
+}
+
+fn cmd_send_http(args: &[String], node_url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let dry = args.iter().any(|a| a == "--dry-run");
+    let from_key = load_private_key(args)?;
+    let from_pk = from_key.public_key();
+    let to_bytes = parse_hex_arg(args, "--to")?;
+    let to_pk = validate_public_key(&to_bytes, "адрес")?;
+    let amt_str = args.iter().position(|a| a == "--amount").and_then(|i| args.get(i + 1)).ok_or("--amount required")?;
+    let amt_f: f64 = amt_str.parse().map_err(|_| "Amount")?;
+    if amt_f <= 0.0 { return Err("Amount > 0".into()); }
+    let amount: u64 = (amt_f * 100_000_000.0) as u64;
+    let fee = calculate_fee(amount);
+    let need = amount + fee;
+    
+    let resp = ureq::get(&format!("{}/utxos?address={}", node_url, hex::encode(from_pk.to_bytes()))).call()?.into_string()?;
+    let utxos_json: Vec<serde_json::Value> = serde_json::from_str(&resp)?;
+    
+    let mut total: u64 = 0;
+    let mut selected: Vec<&serde_json::Value> = Vec::new();
+    for u in &utxos_json {
+        if total >= need { break; }
+        total += u["amount"].as_u64().unwrap_or(0);
+        selected.push(u);
+    }
+    
+    if total < need {
+        return Err(format!("Недостаточно: {:.8} AEV, нужно {:.8}", total as f64/100_000_000.0, need as f64/100_000_000.0).into());
+    }
+    
+    let change = total.saturating_sub(need);
+    println!("Выбрано UTXO: {}", selected.len());
+    println!("├─ Всего:      {:.8} AEV", total as f64/100_000_000.0);
+    println!("├─ Комиссия:   {:.8} AEV (0.01%)", fee as f64/100_000_000.0);
+    println!("├─ К отправке: {:.8} AEV", amount as f64/100_000_000.0);
+    if change > 0 { println!("├─ Сдача:      {:.8} AEV", change as f64/100_000_000.0); }
+    
+    if dry { println!("\n🔍 Dry-run."); return Ok(()); }
+    
+    // Создаём входы с реальными tx_hash, nullifier, output_index
+    let mut inputs = Vec::new();
+    for u in &selected {
+        let tx_hash_hex = u["tx_hash"].as_str().unwrap_or("");
+        let nullifier_hex = u["nullifier"].as_str().unwrap_or("");
+        let oi = u["output_index"].as_u64().unwrap_or(0) as u32;
+        let tx_hash_bytes = hex::decode(tx_hash_hex).unwrap_or(vec![0u8; 32]);
+        let nullifier_bytes = hex::decode(nullifier_hex).unwrap_or(vec![0u8; 32]);
+        let mut th = [0u8; 32]; th.copy_from_slice(&tx_hash_bytes[..32]);
+        let mut n = [0u8; 32]; n.copy_from_slice(&nullifier_bytes[..32]);
+        inputs.push(TxInput {
+            tx_hash: Hash(th), output_index: oi, nullifier: Hash(n),
+            signature: vec![], public_key: from_pk.clone(),
+            signed_hash: Hash::zero(), nonce: 1,
+        });
+    }
+    
+    let mut outs = vec![TxOutput::new(
+        to_pk.clone(), amount,
+        aevum::crypto::hash::AmountCommitment::dummy(),
+        aevum::crypto::hash::TagCommitment::dummy(),
+        Hash::zero(), 0,
+        aevum::core::jt_utxo::ZkProof::empty(),
+        Hash::zero(),
+        aevum::core::jt_utxo::RESTRICTION_GLOBAL_CLEAN, 0,
+    )];
+    
+    if change > 0 {
+        outs.push(TxOutput::new(
+            from_pk.clone(), change,
+            aevum::crypto::hash::AmountCommitment::dummy(),
+            aevum::crypto::hash::TagCommitment::dummy(),
+            Hash::zero(), 1,
+            aevum::core::jt_utxo::ZkProof::empty(),
+            Hash::zero(),
+            aevum::core::jt_utxo::RESTRICTION_GLOBAL_CLEAN, 0,
+        ));
+    }
+    
+    let mut tx = Transaction::new(inputs.clone(), outs, fee);
+    let sig = from_key.sign(tx.tx_hash.as_bytes());
+    for i in 0..selected.len() {
+        let tx_hash_hex = selected[i]["tx_hash"].as_str().unwrap_or("");
+        let tx_hash_bytes = hex::decode(tx_hash_hex).unwrap_or(vec![0u8; 32]);
+        let mut th = [0u8; 32]; th.copy_from_slice(&tx_hash_bytes[..32]);
+        tx.sign_input(&Hash(th), i, sig.to_vec(), from_pk.clone()).ok();
+    }
+    
+    let body = serde_json::to_string(&tx)?;
+    let resp = ureq::post(&format!("{}/tx", node_url))
+        .set("Content-Type", "application/json")
+        .send_string(&body)?
+        .into_string()?;
+    println!("Отправлено: {}", resp);
+    println!("Транзакция: {}", tx.tx_hash.to_hex());
+    Ok(())
+}
+
+// ============================================================
+// ВСЕ ОРИГИНАЛЬНЫЕ МЕТОДЫ (полностью сохранены)
+// ============================================================
 
 fn parse_hex_arg(args: &[String], name: &str) -> Result<[u8; 32], String> {
     let hex_str = args.iter().position(|a| a == name).and_then(|i| args.get(i + 1))
@@ -325,7 +444,7 @@ fn cmd_risk_check(args: &[String], db_path: &PathBuf) -> Result<(), Box<dyn std:
             _ => "Неизвестный",
         };
         let taint = aevum::core::jt_utxo::decay_taint(u.taint_distance, u.taint_timestamp, h);
-        println!("├─ Сумма: {:.8} AEV | Категория: {} | Taint: {} хопов | Статус: {}", 
+        println!("├─ Сумма: {:.8} AEV | Категория: {} | Taint: {} хопов | Статус: {}",
             u.amount() as f64 / 100_000_000.0, cat_name, taint, status);
     }
     if !found { println!("├─ Нет UTXO для этого адреса"); }

@@ -50,7 +50,7 @@ fn create_genesis_block() -> Block {
 }
 
 #[derive(Parser)]
-#[command(name = "aevum-node", version = "0.6.0")]
+#[command(name = "aevum-node", version = "0.6.2")]
 struct Cli {
     #[arg(long, default_value = "0.0.0.0:9733")] listen_addr: String,
     #[arg(long, default_value = "")] bootstrap_peers: String,
@@ -93,31 +93,39 @@ struct ConnectCommand {
     ctx: Arc<SyncContext>,
 }
 
+struct BalanceCache {
+    balances: BTreeMap<String, u64>,
+    last_update: Instant,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
     let our_key = load_miner_key(&cli)?.unwrap_or_else(|| PrivateKey::generate());
     let miner_pubkey = our_key.public_key();
-
     let storage = Arc::new(StdMutex::new(Storage::open(&cli.db_path)?.with_encryption(&miner_pubkey.to_bytes())));
 
-    // Генезис: создаём только если bootstrap_mode ИЛИ БД пустая
+    let builtin_genesis = create_genesis_block();
     {
         let mut st = storage.lock().unwrap();
         if st.max_genesis_height()?.is_none() {
             if cli.bootstrap_mode {
-                let genesis = create_genesis_block();
-                st.save_genesis_block(&genesis)?;
-                tracing::info!("[GENESIS] Bootstrap genesis created: hash={}", genesis.block_hash.to_hex());
+                st.save_genesis_block(&builtin_genesis)?;
+                tracing::info!("[GENESIS] Bootstrap genesis created: hash={}", builtin_genesis.block_hash.to_hex());
             } else {
                 tracing::info!("[GENESIS] No genesis yet — will download from peers");
+            }
+        } else if let Ok(Some(existing)) = st.load_genesis_block(0) {
+            if existing.block_hash != builtin_genesis.block_hash {
+                st.save_my_block(0, &existing).ok();
+                st.delete_genesis_block(0).ok();
+                st.save_genesis_block(&builtin_genesis)?;
             }
         }
     }
 
     let max_height = storage.lock().unwrap().max_genesis_height()?.unwrap_or(0);
     tracing::info!("Height: {}", max_height);
-
     let serial_counter: u64 = storage.lock().unwrap().load_metadata(SERIAL_COUNTER_KEY).ok().flatten()
         .map(|b| bincode::deserialize::<u64>(&b).unwrap_or(0)).unwrap_or(0);
     let serial_counter = Arc::new(StdMutex::new(serial_counter));
@@ -126,9 +134,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(snap) = storage.lock().unwrap().load_metadata(POH_SNAPSHOT_KEY)? {
         if let Ok(snap) = bincode::deserialize::<PohSnapshot>(&snap) { validator.restore_poh_from_snapshot(&snap); }
     }
-    
     let utxo_set = storage.lock().unwrap().load_utxo_set().unwrap_or_else(|_| UtxoSet::new());
-    if utxo_set.is_empty() && max_height > 0 {
+    if utxo_set.is_empty() {
         let mut temp_val = Validator::new(b"aevum_genesis_seed");
         for h in 0..=max_height {
             if let Ok(Some(mut block)) = storage.lock().unwrap().load_genesis_block(h) {
@@ -140,13 +147,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(lb) = storage.lock().unwrap().load_genesis_block(max_height)? {
             validator.set_last_block(lb.block_hash, lb.height, lb.poh_tick_end);
         }
-    } else if !utxo_set.is_empty() {
+    } else {
         validator.load_utxo_set(utxo_set);
         validator.genesis_applied = true;
         if let Some(lb) = storage.lock().unwrap().load_genesis_block(max_height)? {
             validator.set_last_block(lb.block_hash, lb.height, lb.poh_tick_end);
         }
-        if validator.utxo_set().total_supply() == 0 && max_height > 0 {
+        if validator.utxo_set().total_supply() == 0 {
             if let Ok(Some(lb)) = storage.lock().unwrap().load_genesis_block(max_height) {
                 validator.utxo_set_mut().set_total_supply(lb.total_supply);
             }
@@ -157,7 +164,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mempool = Arc::new(StdMutex::new(Mempool::new(10_000)));
     let chain_sync = Arc::new(StdMutex::new(ChainSync::new(100)));
     let block_buffer = Arc::new(StdMutex::new(BTreeMap::new()));
-
     let dev_addr_bytes = hex::decode(&cli.developer_address).expect("Invalid dev addr");
     let mut dev_bytes = [0u8; 32]; dev_bytes.copy_from_slice(&dev_addr_bytes[..32]);
     let developer_address = aevum::crypto::keys::PublicKey::from_bytes(dev_bytes).expect("Invalid dev key");
@@ -168,7 +174,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let replication = Arc::new(StdMutex::new(EncryptedReplication::new(Some(our_key.clone()), 1000)));
     let orchestrator = Arc::new(StdMutex::new(ChainOrchestrator::recover(&storage.lock().unwrap())));
     let network_height = Arc::new(StdMutex::new(max_height));
+    let last_peer_discovery = Arc::new(StdMutex::new(Instant::now()));
     let bootstrap_peers_list: Vec<String> = if cli.bootstrap_peers.is_empty() { vec![] } else { cli.bootstrap_peers.split(',').map(|s| s.trim().to_string()).collect() };
+    let balance_cache = Arc::new(StdMutex::new(BalanceCache { balances: BTreeMap::new(), last_update: Instant::now() }));
 
     let sync_ctx = Arc::new(SyncContext {
         validator: validator.clone(), storage: storage.clone(),
@@ -180,18 +188,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown = Arc::new(AtomicBool::new(false));
     ctrlc::set_handler({ let s = shutdown.clone(); move || { tracing::info!("Ctrl+C"); s.store(true, Ordering::SeqCst); } }).expect("Ctrl+C handler");
 
-    let (connect_tx, mut connect_rx) = tokio_mpsc::unbounded_channel::<ConnectCommand>();
-
     // ATP ПОТОК
     let server_listen_addr = cli.listen_addr.clone();
     let atp_peers = peers.clone(); let atp_ctx = sync_ctx.clone(); let atp_key = our_key.clone(); let atp_tofu = tofu.clone(); let atp_shutdown = shutdown.clone();
     let atp_bootstrap = bootstrap_peers_list.clone();
-
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).thread_name("aevum-atp").enable_all().build().unwrap();
         rt.block_on(async move {
             let listener = match TcpListener::bind(&server_listen_addr).await { Ok(l) => l, Err(e) => { tracing::error!("Bind: {}", e); return; } };
-            
             if !atp_bootstrap.is_empty() {
                 let dp = atp_peers.clone(); let dc = atp_ctx.clone(); let dk = atp_key.clone(); let dt = atp_tofu.clone(); let ds = atp_shutdown.clone();
                 tokio::spawn(async move {
@@ -205,10 +209,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     Ok((cipher, peer_id, reader, writer)) => {
                                         tracing::info!("[ATP] ✅ Bootstrap CONNECTED to {}", addr);
                                         let conn = AtpConnection::new(cipher, peer_id, addr, dp.clone(), dc.clone(), false);
-                                        tokio::spawn(async move { conn.run(reader, writer).await; });
+                                        let conn_handle = tokio::spawn(async move { conn.run(reader, writer).await; });
                                         tokio::time::sleep(Duration::from_millis(100)).await;
                                         aevum_node::p2p::pex::PeerExchange::request_peers(&dp, &peer_id);
-                                        break;
+                                        let _ = conn_handle.await; break;
                                     }
                                     Err(e) => tracing::warn!("[ATP] Bootstrap dial failed {}: {}", addr, e),
                                 }
@@ -217,102 +221,114 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 });
             }
-
             while !atp_shutdown.load(Ordering::SeqCst) {
-                tokio::select! {
-                    accept_result = tokio::time::timeout(Duration::from_secs(1), listener.accept()) => {
-                        match accept_result {
-                            Ok(Ok((stream, addr))) => {
-                                if !atp_peers.can_accept(&addr) { continue; }
-                                let pc = atp_peers.clone(); let cc = atp_ctx.clone(); let kc = atp_key.clone(); let tc = atp_tofu.clone();
-                                tokio::spawn(async move {
-                                    match aevum_node::p2p::peers::accept_connection(stream, kc, &tc).await {
-                                        Ok((cipher, peer_id, remote_addr, reader, writer)) => {
-                                            tracing::info!("[ATP] ✅ ACCEPTED from {}", remote_addr);
-                                            AtpConnection::new(cipher, peer_id, remote_addr, pc, cc, true).run(reader, writer).await;
-                                        }
-                                        Err(e) => tracing::warn!("Accept failed: {}", e),
-                                    }
-                                });
-                            }
-                            Ok(Err(e)) => tracing::error!("Accept error: {}", e),
-                            Err(_) => {}
-                        }
-                    }
-                    Some(cmd) = connect_rx.recv() => {
-                        let dp = cmd.peers.clone();
-                        let dc = cmd.ctx.clone();
-                        let dk = cmd.our_key.clone();
-                        let dt = cmd.tofu.clone();
-                        let addr = cmd.addr;
+                match tokio::time::timeout(Duration::from_secs(1), listener.accept()).await {
+                    Ok(Ok((stream, addr))) => {
+                        if !atp_peers.can_accept(&addr) { continue; }
+                        let pc = atp_peers.clone(); let cc = atp_ctx.clone(); let kc = atp_key.clone(); let tc = atp_tofu.clone();
                         tokio::spawn(async move {
-                            match aevum_node::p2p::peers::dial_peer(addr, dk, &dt).await {
-                                Ok((cipher, peer_id, reader, writer)) => {
-                                    tracing::info!("[ATP] ✅ Reconnect CONNECTED to {}", addr);
-                                    AtpConnection::new(cipher, peer_id, addr, dp, dc, false).run(reader, writer).await;
+                            match aevum_node::p2p::peers::accept_connection(stream, kc, &tc).await {
+                                Ok((cipher, peer_id, remote_addr, reader, writer)) => {
+                                    tracing::info!("[ATP] ✅ ACCEPTED from {}", remote_addr);
+                                    AtpConnection::new(cipher, peer_id, remote_addr, pc, cc, true).run(reader, writer).await;
                                 }
-                                Err(e) => tracing::warn!("[ATP] Reconnect failed {}: {}", addr, e),
+                                Err(e) => tracing::warn!("Accept failed: {}", e),
                             }
                         });
                     }
+                    Ok(Err(e)) => tracing::error!("Accept error: {}", e),
+                    Err(_) => {}
                 }
             }
         });
     });
 
-    // HTTP
+    // HTTP с /balance, /utxos и кешем
     let http_port = cli.http_port;
     let mempool_http = mempool.clone(); let validator_http = validator.clone(); let peers_http = peers.clone();
     let shutdown_http = shutdown.clone(); let start_time = Instant::now();
     let network_height_http = network_height.clone();
+    let balance_cache_http = balance_cache.clone();
+    let miner_pubkey_http = miner_pubkey.clone();
     std::thread::spawn(move || {
         let server = match tiny_http::Server::http(&format!("0.0.0.0:{}", http_port)) { Ok(s) => s, Err(_) => return };
         while !shutdown_http.load(Ordering::SeqCst) {
             if let Ok(Some(mut req)) = server.recv_timeout(Duration::from_secs(1)) {
-                match (req.url(), req.method()) {
-                    ("/health", _) => { req.respond(cors_response("{\"status\":\"ok\"}")).ok(); }
-                    ("/status", _) => {
-                        let val = validator_http.lock().unwrap();
-                        let nh = *network_height_http.lock().unwrap();
-                        let synced = val.last_block_height() >= nh;
-                        let s = format!("{{\"height\":{},\"peers\":{},\"mempool\":{},\"utxos\":{},\"poh_tick\":{},\"supply\":{},\"uptime_sec\":{},\"network_height\":{},\"synced\":{}}}",
-                            val.last_block_height(), peers_http.peer_count(), mempool_http.lock().unwrap().len(),
-                            val.utxo_set().len(), val.poh().current_tick_number(), val.utxo_set().total_supply(), start_time.elapsed().as_secs(), nh, synced);
-                        req.respond(cors_response(&s)).ok();
+                let url = req.url().to_string();
+                let method = req.method();
+                
+                if url == "/health" {
+                    req.respond(cors_response("{\"status\":\"ok\"}")).ok();
+                } else if url.starts_with("/status") {
+                    let val = validator_http.lock().unwrap();
+                    let nh = *network_height_http.lock().unwrap();
+                    let synced = val.last_block_height() >= nh;
+                    let s = format!("{{\"height\":{},\"peers\":{},\"mempool\":{},\"utxos\":{},\"poh_tick\":{},\"supply\":{},\"uptime_sec\":{},\"network_height\":{},\"synced\":{}}}",
+                        val.last_block_height(), peers_http.peer_count(), mempool_http.lock().unwrap().len(),
+                        val.utxo_set().len(), val.poh().current_tick_number(), val.utxo_set().total_supply(), start_time.elapsed().as_secs(), nh, synced);
+                    req.respond(cors_response(&s)).ok();
+                } else if url.starts_with("/balance") {
+                    let val = validator_http.lock().unwrap();
+                    let utxo_set = val.utxo_set();
+                    let mut cache = balance_cache_http.lock().unwrap();
+                    if cache.last_update.elapsed() > Duration::from_secs(30) {
+                        cache.balances.clear();
+                        for (_, utxo) in utxo_set.all() {
+                            let addr = hex::encode(utxo.owner().to_bytes());
+                            *cache.balances.entry(addr).or_insert(0) += utxo.amount();
+                        }
+                        cache.last_update = Instant::now();
                     }
-                    ("/tx", &Method::Post) => {
-                        let mut body = String::new(); req.as_reader().read_to_string(&mut body).ok();
-                        if let Ok(tx) = serde_json::from_str::<Transaction>(&body) {
-                            mempool_http.lock().unwrap().insert(tx).ok();
-                            req.respond(cors_response("{\"status\":\"ok\"}")).ok();
-                        } else { req.respond(cors_response("{\"status\":\"err\"}")).ok(); }
+                    let miner_addr = hex::encode(miner_pubkey_http.to_bytes());
+                    let founder_addr = GENESIS_ADDRESS;
+                    let miner_balance = cache.balances.get(&miner_addr).copied().unwrap_or(0) as f64 / 100_000_000.0;
+                    let founder_balance = cache.balances.get(founder_addr).copied().unwrap_or(0) as f64 / 100_000_000.0;
+                    let total = utxo_set.total_supply() as f64 / 100_000_000.0;
+                    let s = format!("{{\"miner\":\"{}\",\"miner_aev\":{},\"founder_aev\":{},\"total_aev\":{}}}",
+                        &miner_addr[..16], miner_balance, founder_balance, total);
+                    req.respond(cors_response(&s)).ok();
+                } else if url.starts_with("/utxos") {
+                    let val = validator_http.lock().unwrap();
+                    let utxo_set = val.utxo_set();
+                    let addr_param = url.split("address=").nth(1).unwrap_or("");
+                    let mut result = String::from("[");
+                    for (_, u) in utxo_set.all() {
+                        if addr_param.is_empty() || hex::encode(u.owner().to_bytes()).starts_with(addr_param) {
+                            result.push_str(&format!("{{\"amount\":{},\"height\":{},\"tx_hash\":\"{}\",\"nullifier\":\"{}\",\"output_index\":{}}},", u.amount(), u.created_height(), hex::encode(u.tx_hash().as_bytes()), hex::encode(u.nullifier().as_bytes()), u.output_index()));
+                        }
                     }
-                    _ => { req.respond(Response::from_string("404").with_status_code(StatusCode(404))).ok(); }
+                    if result.ends_with(',') { result.pop(); }
+                    result.push(']');
+                    req.respond(cors_response(&result)).ok();
+                } else if url.starts_with("/tx") && method == &Method::Post {
+                    let mut body = String::new(); req.as_reader().read_to_string(&mut body).ok();
+                    if let Ok(tx) = serde_json::from_str::<Transaction>(&body) {
+                        mempool_http.lock().unwrap().insert(tx).ok();
+                        req.respond(cors_response("{\"status\":\"ok\"}")).ok();
+                    } else { req.respond(cors_response("{\"status\":\"err\"}")).ok(); }
+                } else {
+                    req.respond(Response::from_string("404").with_status_code(StatusCode(404))).ok();
                 }
             }
         }
     });
 
-    // МАЙНИНГ + АВТО-ПЕРЕПОДКЛЮЧЕНИЕ + САМОПРИМЕНЕНИЕ ГЕНЕЗИСА
+    // МАЙНИНГ + АВТО-ПЕРЕПОДКЛЮЧЕНИЕ
+    let (connect_tx, mut connect_rx) = tokio_mpsc::unbounded_channel::<ConnectCommand>();
     if let Some(mk) = load_miner_key(&cli)? {
         let vm = validator.clone(); let mm = mempool.clone(); let sm = storage.clone();
         let dam = developer_address; let sc = serial_counter.clone(); let shm = shutdown.clone(); let pm = peers.clone(); let s_m = sync_ctx.clone();
-        let nh = network_height.clone();
-        let connect_tx = connect_tx.clone();
+        let nh = network_height.clone(); let lpd = last_peer_discovery.clone();
         let atp_key2 = our_key.clone(); let atp_tofu2 = tofu.clone(); let atp_ctx2 = sync_ctx.clone();
         let atp_peers2 = peers.clone(); let dht2 = dht.clone();
-        let last_discovery = Arc::new(StdMutex::new(Instant::now()));
+        let connect_tx_mining = connect_tx.clone();
         let bootstrap_addrs: Vec<String> = vec!["186.246.14.202:9733".to_string(), "82.127.255.223:9733".to_string()];
-        
         std::thread::spawn(move || {
             while !shm.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_secs(1));
-                
                 let network_h = *nh.lock().unwrap();
                 let our_h = vm.lock().unwrap().last_block_height();
                 let peer_count = pm.peer_count();
-                
-                // САМОПРИМЕНЕНИЕ ГЕНЕЗИСА
                 {
                     let mut val = vm.lock().unwrap();
                     if !val.genesis_applied {
@@ -322,7 +338,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let mut g = genesis.clone();
                             if val.validate_and_apply(&mut g).is_ok() {
                                 val.last_block_hash = genesis.block_hash;
-                                tracing::info!("⛓️ Genesis self-applied: hash={}", genesis.block_hash.to_hex());
                                 drop(val);
                                 flush_block_buffer(&s_m);
                                 continue;
@@ -331,23 +346,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     if !val.genesis_applied { continue; }
                 }
-                
-                // АВТО-ПЕРЕПОДКЛЮЧЕНИЕ
-                if peer_count < MIN_PEERS && last_discovery.lock().unwrap().elapsed().as_secs() > PEER_DISCOVERY_INTERVAL {
-                    *last_discovery.lock().unwrap() = Instant::now();
-                    
-                    for entry in pm.known_addresses.iter() {
-                        let addr = *entry.key();
-                        if pm.can_connect_to(&addr) {
-                            pm.mark_connecting(addr);
-                            let _ = connect_tx.send(ConnectCommand { addr, our_key: atp_key2.clone(), tofu: atp_tofu2.clone(), peers: atp_peers2.clone(), ctx: atp_ctx2.clone() });
-                        }
-                    }
+                if peer_count < MIN_PEERS && lpd.lock().unwrap().elapsed().as_secs() > PEER_DISCOVERY_INTERVAL {
+                    *lpd.lock().unwrap() = Instant::now();
                     for addr_str in &bootstrap_addrs {
                         if let Ok(addr) = addr_str.parse::<SocketAddr>() {
                             if pm.can_connect_to(&addr) {
                                 pm.mark_connecting(addr);
-                                let _ = connect_tx.send(ConnectCommand { addr, our_key: atp_key2.clone(), tofu: atp_tofu2.clone(), peers: atp_peers2.clone(), ctx: atp_ctx2.clone() });
+                                let _ = connect_tx_mining.send(ConnectCommand { addr, our_key: atp_key2.clone(), tofu: atp_tofu2.clone(), peers: atp_peers2.clone(), ctx: atp_ctx2.clone() });
                             }
                         }
                     }
@@ -355,13 +360,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for node in dht2.lock().unwrap().random_nodes(8, now, 3600) {
                         if pm.can_connect_to(&node.addr) {
                             pm.mark_connecting(node.addr);
-                            let _ = connect_tx.send(ConnectCommand { addr: node.addr, our_key: atp_key2.clone(), tofu: atp_tofu2.clone(), peers: atp_peers2.clone(), ctx: atp_ctx2.clone() });
+                            let _ = connect_tx_mining.send(ConnectCommand { addr: node.addr, our_key: atp_key2.clone(), tofu: atp_tofu2.clone(), peers: atp_peers2.clone(), ctx: atp_ctx2.clone() });
                         }
                     }
                 }
-                
                 if peer_count > 0 && our_h < network_h { continue; }
-                
                 let mut val = vm.lock().unwrap();
                 let mut mem = mm.lock().unwrap();
                 val.tick_poh();
@@ -372,7 +375,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let txs_backup = if should_mine { mem.take_batch(100) } else { vec![] };
                 let height = val.last_block_height() + 1;
                 drop(mem); drop(val);
-                
                 if should_mine {
                     let mut val = vm.lock().unwrap();
                     let mut st = sm.lock().unwrap();
@@ -407,6 +409,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Heartbeat
     let hb_ctx = sync_ctx.clone(); let hb_peers = peers.clone(); let shutdown_hb = shutdown.clone();
     std::thread::spawn(move || {
         while !shutdown_hb.load(Ordering::SeqCst) {
@@ -416,6 +419,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    tracing::info!("🚀 Aevum Node v0.6.2 — ATP Protocol");
     while !shutdown.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_secs(1)); }
     Ok(())
 }

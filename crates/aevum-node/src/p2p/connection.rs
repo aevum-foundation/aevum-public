@@ -51,8 +51,6 @@ impl AtpConnection {
         tracing::info!("[ATP] start_sync: our={}, peer={}", our_height, self.peer_height);
         let status = create_status(&self.ctx);
         if let Ok(data) = bincode::serialize(&status) { self.pending_outgoing.push(data); }
-        let pex_msg = PeerExchange::create_peer_list(&self.peers, 20);
-        if let Ok(data) = bincode::serialize(&pex_msg) { self.pending_outgoing.push(data); }
         if our_height == 0 {
             let req = AtpMessage::HeaderRequest { from: 0, to: self.peer_height.min(499) };
             if let Ok(data) = bincode::serialize(&req) { self.pending_outgoing.push(data); }
@@ -80,6 +78,7 @@ impl AtpConnection {
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
         self.outgoing_tx = Some(tx.clone());
         self.peers.register_peer(self.peer_id, self.addr, self.outgoing_tx.as_ref().unwrap().clone());
+        tracing::info!("[ATP] run() START peer={} total_peers={}", hex::encode(&self.peer_id), self.peers.peer_count());
 
         let send_cipher = self.send_cipher.clone();
         let recv_cipher = self.recv_cipher.clone();
@@ -117,7 +116,7 @@ impl AtpConnection {
             }
         }
 
-        tracing::info!("[ATP] Handshake done, calling start_sync");
+        tracing::info!("[ATP] Handshake done, calling start_sync. peers={}", self.peers.peer_count());
         self.start_sync();
         self.state = ConnState::Active;
 
@@ -147,7 +146,13 @@ impl AtpConnection {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 let our_h = sync_ctx.validator.lock().unwrap().last_block_height();
                 let req = AtpMessage::HeaderRequest { from: our_h + 1, to: our_h + 500 };
-                if let Ok(data) = bincode::serialize(&req) { let _ = sync_tx.try_send(data); }
+                tracing::info!("[SYNC-HANDLE] Requesting blocks {}-{}", our_h + 1, our_h + 500);
+                if let Ok(data) = bincode::serialize(&req) { 
+                    match sync_tx.try_send(data) {
+                        Ok(_) => tracing::info!("[SYNC-HANDLE] Request sent to channel"),
+                        Err(e) => tracing::warn!("[SYNC-HANDLE] Failed to send: {:?}", e),
+                    }
+                }
             }
         });
 
@@ -179,6 +184,9 @@ impl AtpConnection {
                                         if let Ok(data) = bincode::serialize(&pong) { let _ = tx.try_send(data); }
                                         continue;
                                     }
+                                    if let AtpMessage::HeaderRequest { from, to } = &msg {
+                                        tracing::info!("[SYNC] Received HeaderRequest from={} to={}", from, to);
+                                    }
                                     handle_atp_message(msg, &ctx, &peer_id, &peers);
                                 }
                             }
@@ -191,6 +199,7 @@ impl AtpConnection {
         keepalive_handle.abort();
         sync_handle.abort();
         self.peers.remove_peer(&peer_id);
+        tracing::info!("[ATP] Disconnected: {} (peers left: {})", hex::encode(&peer_id), self.peers.peer_count());
     }
 
     async fn send_status(send_cipher: &Arc<TokioMutex<AtpCipher>>, ctx: &Arc<SyncContext>, writer: &mut WriteHalf<TcpStream>, _peer_id: &[u8; 20]) {
