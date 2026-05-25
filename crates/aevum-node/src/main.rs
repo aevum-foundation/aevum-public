@@ -252,13 +252,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
-    // HTTP
+    // HTTP с /history
     let http_port = cli.http_port;
     let mempool_http = mempool.clone(); let validator_http = validator.clone(); let peers_http = peers.clone();
     let shutdown_http = shutdown.clone(); let start_time = Instant::now();
     let network_height_http = network_height.clone();
     let balance_cache_http = balance_cache.clone();
     let miner_pubkey_http = miner_pubkey.clone();
+    let storage_http = storage.clone();
     std::thread::spawn(move || {
         let server = match tiny_http::Server::http(&format!("0.0.0.0:{}", http_port)) { Ok(s) => s, Err(_) => return };
         while !shutdown_http.load(Ordering::SeqCst) {
@@ -309,10 +310,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if result.ends_with(',') { result.pop(); }
                     result.push(']');
                     req.respond(cors_response(&result)).ok();
+                } else if url.starts_with("/history") {
+                    let addr_param = url.split("address=").nth(1).unwrap_or("");
+                    let limit = url.split("limit=").nth(1).and_then(|s| s.split("&").next()).and_then(|s| s.parse::<usize>().ok()).unwrap_or(10);
+                    let st = storage_http.lock().unwrap();
+                    let h = st.max_genesis_height().unwrap_or(None).unwrap_or(0);
+                    let mut result = String::from("[");
+                    let mut found = 0usize;
+                    for bh in (0..=h).rev() {
+                        if found >= limit { break; }
+                        if let Ok(Some(block)) = st.load_genesis_block(bh) {
+                            for tx in &block.transactions {
+                                let mut involved = false;
+                                if addr_param.is_empty() { involved = true; }
+                                for i in &tx.inputs {
+                                    if hex::encode(i.public_key.to_bytes()).starts_with(&addr_param) { involved = true; }
+                                }
+                                for o in &tx.outputs {
+                                    if hex::encode(o.owner.to_bytes()).starts_with(&addr_param) { involved = true; }
+                                }
+                                if involved {
+                                    result.push_str(&format!("{{\"height\":{},\"tx_hash\":\"{}\",\"fee\":{}}},", bh, tx.tx_hash.to_hex(), tx.fee));
+                                    found += 1;
+                                }
+                            }
+                        }
+                    }
+                    if result.ends_with(',') { result.pop(); }
+                    result.push(']');
+                    req.respond(cors_response(&result)).ok();
                 } else if url.starts_with("/tx") && method == &Method::Post {
                     let mut body = String::new(); req.as_reader().read_to_string(&mut body).ok();
                     if let Ok(tx) = serde_json::from_str::<Transaction>(&body) {
-                        mempool_http.lock().unwrap().insert(tx).ok();
+                        mempool_http.lock().unwrap().insert(tx.clone()).ok();
+                        if let Ok(data) = bincode::serialize(&AtpMessage::Transaction { tx_hash: [0u8; 32], ttl: 0, bytes: bincode::serialize(&tx).unwrap_or_default() }) { peers_http.broadcast(data); }
                         req.respond(cors_response("{\"status\":\"ok\"}")).ok();
                     } else { req.respond(cors_response("{\"status\":\"err\"}")).ok(); }
                 } else {
@@ -340,21 +371,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let network_h = *nh.lock().unwrap();
                 let our_h = vm.lock().unwrap().last_block_height();
                 let peer_count = pm.peer_count();
-                
-                // Проверка генезиса — всегда отпускаем val перед любым continue
                 {
                     let val = vm.lock().unwrap();
                     if !val.genesis_applied {
                         let st = sm.lock().unwrap();
                         if let Ok(Some(genesis)) = st.load_genesis_block(0) {
-                            drop(st);
-                            drop(val);
-                            // Применяем генезис с новым локом
+                            drop(st); drop(val);
                             let mut v = vm.lock().unwrap();
                             let mut g = genesis.clone();
                             if v.validate_and_apply(&mut g).is_ok() {
                                 v.last_block_hash = genesis.block_hash;
-                                tracing::info!("⛓️ Genesis self-applied: hash={}", genesis.block_hash.to_hex());
                             }
                             drop(v);
                             flush_block_buffer(&s_m);
@@ -363,16 +389,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             drop(st);
                             if peer_count > 0 && !gr.load(Ordering::SeqCst) {
                                 gr.store(true, Ordering::SeqCst);
-                                tracing::info!("[GENESIS] Requesting block 0 from peers...");
                                 let req = AtpMessage::HeaderRequest { from: 0, to: 0 };
                                 if let Ok(data) = bincode::serialize(&req) { pm.broadcast(data); }
                             }
                         }
                         continue;
                     }
-                    // val дропается здесь
                 }
-                
                 if peer_count < MIN_PEERS && lpd.lock().unwrap().elapsed().as_secs() > PEER_DISCOVERY_INTERVAL {
                     *lpd.lock().unwrap() = Instant::now();
                     for addr_str in &bootstrap_addrs {
@@ -383,17 +406,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
-                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-                    for node in dht2.lock().unwrap().random_nodes(8, now, 3600) {
-                        if pm.can_connect_to(&node.addr) {
-                            pm.mark_connecting(node.addr);
-                            let _ = connect_tx_mining.send(ConnectCommand { addr: node.addr, our_key: atp_key2.clone(), tofu: atp_tofu2.clone(), peers: atp_peers2.clone(), ctx: atp_ctx2.clone() });
-                        }
-                    }
                 }
-                
                 if peer_count > 0 && our_h < network_h { continue; }
-                
                 let mut val = vm.lock().unwrap();
                 let mut mem = mm.lock().unwrap();
                 val.tick_poh();
@@ -404,7 +418,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let txs_backup = if should_mine { mem.take_batch(100) } else { vec![] };
                 let height = val.last_block_height() + 1;
                 drop(mem); drop(val);
-                
                 if should_mine {
                     let mut val = vm.lock().unwrap();
                     let mut st = sm.lock().unwrap();

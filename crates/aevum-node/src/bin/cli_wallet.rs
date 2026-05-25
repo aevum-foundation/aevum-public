@@ -61,7 +61,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_help() {
-    println!("Aevum CLI Wallet v1.0");
+    println!("Aevum CLI Wallet v1.1");
     println!("  balance --address <АДРЕС> --db <ПУТЬ> [--node-url <URL>]");
     println!("  send --from-key-file <ФАЙЛ> --to <АДРЕС> --amount <СУММА> [--dry-run] --db <ПУТЬ> [--node-url <URL>]");
     println!("  history --address <АДРЕС> [--limit N] --db <ПУТЬ>");
@@ -82,7 +82,7 @@ fn print_help() {
 }
 
 // ============================================================
-// HTTP МЕТОДЫ (без остановки ноды)
+// HTTP методы с ПРАВИЛЬНЫМИ входами и ПОДПИСЬЮ
 // ============================================================
 
 fn cmd_balance_http(args: &[String], node_url: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -109,6 +109,7 @@ fn cmd_send_http(args: &[String], node_url: &str) -> Result<(), Box<dyn std::err
     let fee = calculate_fee(amount);
     let need = amount + fee;
     
+    // Получаем UTXO через HTTP
     let resp = ureq::get(&format!("{}/utxos?address={}", node_url, hex::encode(from_pk.to_bytes()))).call()?.into_string()?;
     let utxos_json: Vec<serde_json::Value> = serde_json::from_str(&resp)?;
     
@@ -192,7 +193,7 @@ fn cmd_send_http(args: &[String], node_url: &str) -> Result<(), Box<dyn std::err
 }
 
 // ============================================================
-// ВСЕ ОРИГИНАЛЬНЫЕ МЕТОДЫ (полностью сохранены)
+// ВСЕ ОРИГИНАЛЬНЫЕ МЕТОДЫ (без изменений)
 // ============================================================
 
 fn parse_hex_arg(args: &[String], name: &str) -> Result<[u8; 32], String> {

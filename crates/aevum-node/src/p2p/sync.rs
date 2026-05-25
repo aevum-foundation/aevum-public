@@ -5,7 +5,6 @@ use aevum::crypto::hash::Hash;
 use crate::p2p::peers::PeersManager;
 use crate::storage::Storage;
 use serde::{Deserialize, Serialize};
-use parking_lot::Mutex as PlMutex;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
@@ -59,14 +58,6 @@ pub struct SyncContext {
     pub network_height: Arc<StdMutex<u64>>,
     pub sync_phase: Arc<parking_lot::Mutex<SyncPhase>>,
     pub sync_peer: Arc<parking_lot::Mutex<Option<[u8; 20]>>>,
-}
-
-pub fn find_best_peer(peers: &Arc<PeersManager>, _network_height: &Arc<StdMutex<u64>>) -> Option<[u8; 20]> {
-    let peer_ids: Vec<[u8; 20]> = peers.peers.iter().map(|e| *e.key()).collect();
-    if peer_ids.is_empty() { None } else {
-        use rand::seq::SliceRandom;
-        Some(*peer_ids.choose(&mut rand::thread_rng()).unwrap())
-    }
 }
 
 pub fn create_status(ctx: &SyncContext) -> AtpMessage {
@@ -147,6 +138,11 @@ pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8
             let val = ctx.validator.lock().unwrap(); let nh = *ctx.network_height.lock().unwrap();
             if val.last_block_height() >= nh { let mut phase = ctx.sync_phase.lock(); *phase = SyncPhase::Synced; }
         }
+        AtpMessage::Transaction { bytes, .. } => {
+            // Gossip: рассылаем транзакцию всем пирам
+            let gossip_msg = AtpMessage::Transaction { tx_hash: [0u8; 32], ttl: 0, bytes };
+            if let Ok(data) = bincode::serialize(&gossip_msg) { peers.broadcast(data); }
+        }
         AtpMessage::Ping { nonce } => {
             let pong = AtpMessage::Pong { nonce };
             if let Ok(data) = bincode::serialize(&pong) { peers.send_to(peer_id, data); }
@@ -189,6 +185,7 @@ pub fn flush_block_buffer(ctx: &SyncContext) {
     let our_before = val.last_block_height();
     let mut applied = 0u64;
     let mut need_fork = false;
+
     loop {
         let next = val.last_block_height() + 1;
         if let Some(block_bytes) = buffer.remove(&next) {
@@ -203,6 +200,7 @@ pub fn flush_block_buffer(ctx: &SyncContext) {
     }
     if applied > 0 { tracing::info!("[SYNC] flush: applied {} blocks, height {} -> {}", applied, our_before, val.last_block_height()); }
     drop(buffer); drop(st); drop(val);
+
     if need_fork {
         if let Ok(mut orch) = ctx.orchestrator.lock() {
             let mut v = ctx.validator.lock().unwrap(); let mut s = ctx.storage.lock().unwrap();

@@ -26,17 +26,21 @@ impl AtpNode {
         _mempool: Arc<StdMutex<Mempool>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let our_key = aevum::crypto::keys::PrivateKey::generate();
+
         let peers = Arc::new(PeersManager::new(our_key));
         let sync_ctx = Arc::new(SyncContext {
-            validator, storage, chain_sync,
+            validator,
+            storage,
+            chain_sync,
             block_buffer: Arc::new(StdMutex::new(BTreeMap::new())),
             replication: None,
-            sync_phase: Arc::new(parking_lot::Mutex::new(SyncPhase::Idle)),
-            sync_peer: Arc::new(parking_lot::Mutex::new(None)),
             dht: Arc::new(StdMutex::new(crate::p2p::dht::Dht::new([0u8; 32]))),
             orchestrator: Arc::new(StdMutex::new(crate::p2p::chain_orchestrator::ChainOrchestrator::new())),
             network_height: Arc::new(StdMutex::new(0)),
+            sync_phase: Arc::new(parking_lot::Mutex::new(SyncPhase::Idle)),
+            sync_peer: Arc::new(parking_lot::Mutex::new(None)),
         });
+
         Ok(Self { peers, sync_ctx, listen_addr: listen_addr.to_string(), bootstrap_peers: bootstrap_peers.to_string() })
     }
 
@@ -48,6 +52,7 @@ impl AtpNode {
             rt.block_on(async move {
                 let listener = TcpListener::bind(&listen_addr).await.unwrap();
                 tracing::info!("[ATP] Listening on {}", listen_addr);
+
                 if !bootstrap.is_empty() {
                     for addr_str in bootstrap.split(',') {
                         if let Ok(addr) = addr_str.trim().parse::<SocketAddr>() {
