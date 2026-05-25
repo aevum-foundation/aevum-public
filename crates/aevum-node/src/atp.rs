@@ -3,7 +3,7 @@ use crate::mempool::Mempool;
 use crate::storage::Storage;
 use crate::sync::ChainSync;
 use crate::p2p::peers::PeersManager;
-use crate::p2p::sync::SyncContext;
+use crate::p2p::sync::{SyncContext, SyncPhase};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::net::SocketAddr;
@@ -31,6 +31,8 @@ impl AtpNode {
             validator, storage, chain_sync,
             block_buffer: Arc::new(StdMutex::new(BTreeMap::new())),
             replication: None,
+            sync_phase: Arc::new(parking_lot::Mutex::new(SyncPhase::Idle)),
+            sync_peer: Arc::new(parking_lot::Mutex::new(None)),
             dht: Arc::new(StdMutex::new(crate::p2p::dht::Dht::new([0u8; 32]))),
             orchestrator: Arc::new(StdMutex::new(crate::p2p::chain_orchestrator::ChainOrchestrator::new())),
             network_height: Arc::new(StdMutex::new(0)),
