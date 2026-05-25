@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+parking_lot = { version = "0.12", features = ["send_guard"] }
 argon2 = "0.5"
 aes-gcm = "0.10"
 termios = "0.3"

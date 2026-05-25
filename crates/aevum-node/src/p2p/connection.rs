@@ -1,12 +1,15 @@
 use crate::p2p::peers::PeersManager;
-use crate::p2p::sync::{AtpMessage, SyncContext, create_status, handle_atp_message};
+use crate::p2p::sync::{AtpMessage, SyncContext, SyncPhase, create_status, handle_atp_message, BlockHeader};
 use crate::p2p::noise::AtpCipher;
 use crate::p2p::pex::PeerExchange;
+use crate::p2p::sync_dispatcher::SyncDispatcher;
+use crate::p2p::snapshot_cipher::SnapshotCipher;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tokio::time::Duration;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use std::net::SocketAddr;
 
@@ -27,6 +30,7 @@ pub struct AtpConnection {
     is_server: bool,
     send_cipher: Arc<TokioMutex<AtpCipher>>,
     recv_cipher: Arc<TokioMutex<AtpCipher>>,
+    shared_secret: [u8; 32],
     peers: Arc<PeersManager>,
     ctx: Arc<SyncContext>,
     pending_outgoing: Vec<Vec<u8>>,
@@ -37,130 +41,110 @@ pub struct AtpConnection {
 
 impl AtpConnection {
     pub fn new(cipher: AtpCipher, peer_id: [u8; 20], addr: SocketAddr, peers: Arc<PeersManager>, ctx: Arc<SyncContext>, is_server: bool) -> Self {
+        let shared_secret = cipher.shared_secret_bytes();
         let send_cipher = Arc::new(TokioMutex::new(cipher));
-        let recv_secret = send_cipher.try_lock().unwrap().shared_secret_bytes();
-        let recv_cipher = Arc::new(TokioMutex::new(AtpCipher::new(&recv_secret)));
-        Self { peer_id, addr, is_server, peers, ctx, state: ConnState::Handshaking,
+        let recv_cipher = Arc::new(TokioMutex::new(AtpCipher::new(&shared_secret)));
+        Self {
+            peer_id, addr, is_server, peers, ctx,
+            state: ConnState::Handshaking,
             stats: PeerStats { connected_at: Some(Instant::now()), ..Default::default() },
-            send_cipher, recv_cipher, pending_outgoing: Vec::new(), outgoing_tx: None,
-            peer_height: 0, last_alive: Instant::now() }
-    }
-
-    fn start_sync(&mut self) {
-        let our_height = self.ctx.validator.lock().unwrap().last_block_height();
-        tracing::info!("[ATP] start_sync: our={}, peer={}", our_height, self.peer_height);
-        let status = create_status(&self.ctx);
-        if let Ok(data) = bincode::serialize(&status) { self.pending_outgoing.push(data); }
-        if our_height == 0 {
-            let req = AtpMessage::HeaderRequest { from: 0, to: self.peer_height.min(499) };
-            if let Ok(data) = bincode::serialize(&req) { self.pending_outgoing.push(data); }
-        } else if self.peer_height > our_height {
-            let from = our_height + 1;
-            let req = AtpMessage::HeaderRequest { from, to: self.peer_height };
-            if let Ok(data) = bincode::serialize(&req) { self.pending_outgoing.push(data); }
+            send_cipher, recv_cipher, shared_secret,
+            pending_outgoing: Vec::new(), outgoing_tx: None,
+            peer_height: 0, last_alive: Instant::now(),
         }
-        let dht = &self.ctx.dht;
-        let mut node_id = [0u8; 32];
-        let hash = blake3::hash(self.addr.to_string().as_bytes());
-        node_id.copy_from_slice(&hash.as_bytes()[..32]);
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-        dht.lock().unwrap().add_or_update(node_id, self.addr, now);
-        self.flush();
     }
 
-    fn flush(&mut self) {
-        if let Some(ref tx) = self.outgoing_tx {
-            for data in self.pending_outgoing.drain(..) { let _ = tx.try_send(data); }
+    fn enqueue_msg(&self, msg: &AtpMessage) {
+        if let Ok(data) = bincode::serialize(msg) {
+            tracing::info!("[CONN] ENQUEUE {:?} ({} bytes)", std::mem::discriminant(msg), data.len());
+            if let Some(ref tx) = self.outgoing_tx {
+                match tx.try_send(data) {
+                    Ok(_) => tracing::info!("[CONN] ENQUEUE OK"),
+                    Err(e) => tracing::warn!("[CONN] ENQUEUE FAIL: {:?}", e),
+                }
+            }
         }
     }
 
     pub async fn run(mut self, mut reader: ReadHalf<TcpStream>, mut writer: WriteHalf<TcpStream>) {
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
+        tracing::info!("[CONN] run() START");
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4096);
         self.outgoing_tx = Some(tx.clone());
-        self.peers.register_peer(self.peer_id, self.addr, self.outgoing_tx.as_ref().unwrap().clone());
-        tracing::info!("[ATP] run() START peer={} total_peers={}", hex::encode(&self.peer_id), self.peers.peer_count());
+        self.peers.register_peer(self.peer_id, self.addr, tx);
 
         let send_cipher = self.send_cipher.clone();
         let recv_cipher = self.recv_cipher.clone();
         let peers = self.peers.clone();
         let ctx = self.ctx.clone();
         let peer_id = self.peer_id;
+        let shared_secret = self.shared_secret;
 
+        let sync_in_progress = Arc::new(AtomicBool::new(false));
+        let snap_recv_cipher = SnapshotCipher::new(&shared_secret).recv_cipher;
+
+        // HANDSHAKE
+        tracing::info!("[CONN] HANDSHAKE START");
         if self.is_server {
-            match Self::read_msg(&mut reader).await {
-                Ok(encrypted) => {
-                    if let Some(p) = recv_cipher.lock().await.decrypt(&encrypted) {
-                        if let Ok(msg) = bincode::deserialize::<AtpMessage>(&p) {
-                            if let AtpMessage::Status { height, .. } = &msg { self.peer_height = *height; }
-                            let ctx_h = ctx.clone(); let peers_h = peers.clone(); let pid = peer_id;
-                            tokio::spawn(async move { handle_atp_message(msg, &ctx_h, &pid, &peers_h); });
-                        }
+            if let Ok(encrypted) = Self::read_msg(&mut reader).await {
+                if let Some(p) = recv_cipher.lock().await.decrypt(&encrypted) {
+                    if let Ok(AtpMessage::Status { height, .. }) = bincode::deserialize::<AtpMessage>(&p) {
+                        self.peer_height = height;
                     }
                 }
-                Err(_) => return,
-            }
-            Self::send_status(&send_cipher, &ctx, &mut writer, &peer_id).await;
+            } else { return; }
+            Self::send_msg(&send_cipher, &create_status(&ctx), &mut writer).await;
         } else {
-            Self::send_status(&send_cipher, &ctx, &mut writer, &peer_id).await;
-            match Self::read_msg(&mut reader).await {
-                Ok(encrypted) => {
-                    if let Some(p) = recv_cipher.lock().await.decrypt(&encrypted) {
-                        if let Ok(msg) = bincode::deserialize::<AtpMessage>(&p) {
-                            if let AtpMessage::Status { height, .. } = &msg { self.peer_height = *height; }
-                            let ctx_h = ctx.clone(); let peers_h = peers.clone(); let pid = peer_id;
-                            tokio::spawn(async move { handle_atp_message(msg, &ctx_h, &pid, &peers_h); });
-                        }
+            Self::send_msg(&send_cipher, &create_status(&ctx), &mut writer).await;
+            if let Ok(encrypted) = Self::read_msg(&mut reader).await {
+                if let Some(p) = recv_cipher.lock().await.decrypt(&encrypted) {
+                    if let Ok(AtpMessage::Status { height, .. }) = bincode::deserialize::<AtpMessage>(&p) {
+                        self.peer_height = height;
                     }
                 }
-                Err(_) => return,
-            }
+            } else { return; }
         }
+        tracing::info!("[CONN] HANDSHAKE DONE");
 
-        tracing::info!("[ATP] Handshake done, calling start_sync. peers={}", self.peers.peer_count());
-        self.start_sync();
+        let our_h = { ctx.validator.lock().unwrap().last_block_height() };
+        tracing::info!("[CONN] Handshake done. our_h={}, peer_h={}", our_h, self.peer_height);
+
+        let pex_msg = PeerExchange::create_peer_list(&self.peers, 20);
+        self.enqueue_msg(&pex_msg);
+
+        let mut node_id = [0u8; 32];
+        let hash = blake3::hash(self.addr.to_string().as_bytes());
+        node_id.copy_from_slice(&hash.as_bytes()[..32]);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        { ctx.dht.lock().unwrap().add_or_update(node_id, self.addr, now); }
+
+        let peer_status = AtpMessage::Status {
+            height: self.peer_height, poh_tick: 0, state_root: [0u8; 32],
+            total_supply: 0, version: 1, capabilities: 0x01,
+        };
+        handle_atp_message(peer_status, &ctx, &peer_id, &peers);
+
         self.state = ConnState::Active;
-
         let writer = Arc::new(TokioMutex::new(writer));
-        let kp_writer = writer.clone();
-        let kp_send = send_cipher.clone();
+
+        let kp_tx = self.outgoing_tx.clone().unwrap();
+        let kp_sync = sync_in_progress.clone();
         let keepalive_handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
-                let ping = AtpMessage::Ping { nonce: rand::random() };
-                if let Ok(data) = bincode::serialize(&ping) {
-                    let encrypted = kp_send.lock().await.encrypt(&data);
-                    let len = (encrypted.len() as u32).to_be_bytes();
-                    let mut packet = Vec::with_capacity(4 + encrypted.len());
-                    packet.extend_from_slice(&len); packet.extend_from_slice(&encrypted);
-                    let mut w = kp_writer.lock().await;
-                    if w.write_all(&packet).await.is_err() { break; }
-                    let _ = w.flush().await;
+                if !kp_sync.load(Ordering::SeqCst) {
+                    let ping = AtpMessage::Ping { nonce: rand::random() };
+                    if let Ok(data) = bincode::serialize(&ping) { let _ = kp_tx.try_send(data); }
                 }
             }
         });
 
-        let sync_tx = tx.clone();
-        let sync_ctx = ctx.clone();
-        let sync_handle = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                let our_h = sync_ctx.validator.lock().unwrap().last_block_height();
-                let req = AtpMessage::HeaderRequest { from: our_h + 1, to: our_h + 500 };
-                tracing::info!("[SYNC-HANDLE] Requesting blocks {}-{}", our_h + 1, our_h + 500);
-                if let Ok(data) = bincode::serialize(&req) { 
-                    match sync_tx.try_send(data) {
-                        Ok(_) => tracing::info!("[SYNC-HANDLE] Request sent to channel"),
-                        Err(e) => tracing::warn!("[SYNC-HANDLE] Failed to send: {:?}", e),
-                    }
-                }
-            }
-        });
-
+        tracing::info!("[CONN] ACTIVE LOOP START");
         loop {
             tokio::select! {
                 data = rx.recv() => {
                     match data {
                         Some(d) => {
+                            tracing::info!("[CONN] TX: sending {} bytes", d.len());
                             let encrypted = send_cipher.lock().await.encrypt(&d);
                             let len = (encrypted.len() as u32).to_be_bytes();
                             let mut packet = Vec::with_capacity(4 + encrypted.len());
@@ -168,6 +152,7 @@ impl AtpConnection {
                             let mut w = writer.lock().await;
                             if w.write_all(&packet).await.is_err() { break; }
                             let _ = w.flush().await;
+                            tracing::info!("[CONN] TX: sent");
                         }
                         None => break,
                     }
@@ -175,49 +160,157 @@ impl AtpConnection {
                 result = Self::read_msg(&mut reader) => {
                     match result {
                         Ok(encrypted) => {
+                            tracing::info!("[CONN] RX: {} encrypted bytes", encrypted.len());
                             self.last_alive = Instant::now();
-                            if let Some(p) = recv_cipher.lock().await.decrypt(&encrypted) {
-                                if let Ok(msg) = bincode::deserialize::<AtpMessage>(&p) {
-                                    if let AtpMessage::Pong { .. } = &msg { continue; }
-                                    if let AtpMessage::Ping { nonce } = &msg {
-                                        let pong = AtpMessage::Pong { nonce: *nonce };
-                                        if let Ok(data) = bincode::serialize(&pong) { let _ = tx.try_send(data); }
-                                        continue;
+                            // try main cipher
+                            match recv_cipher.lock().await.decrypt(&encrypted) {
+                                Some(p) => {
+                                    tracing::info!("[CONN] RX: main decrypt OK ({} bytes)", p.len());
+                                    match bincode::deserialize::<AtpMessage>(&p) {
+                                        Ok(msg) => {
+                                            tracing::info!("[CONN] RX: deserialized {:?}", std::mem::discriminant(&msg));
+                                            self.process_message(msg, &ctx, &peers, &peer_id, &writer, &sync_in_progress, &shared_secret).await;
+                                            continue;
+                                        }
+                                        Err(e) => tracing::warn!("[CONN] RX: main deserialize FAIL: {:?}", e),
                                     }
-                                    if let AtpMessage::HeaderRequest { from, to } = &msg {
-                                        tracing::info!("[SYNC] Received HeaderRequest from={} to={}", from, to);
-                                    }
-                                    handle_atp_message(msg, &ctx, &peer_id, &peers);
                                 }
+                                None => tracing::info!("[CONN] RX: main decrypt FAIL, trying snap"),
+                            }
+                            // try snapshot cipher
+                            match snap_recv_cipher.lock().await.decrypt(&encrypted) {
+                                Some(p) => {
+                                    tracing::info!("[CONN] RX: snap decrypt OK ({} bytes)", p.len());
+                                    match bincode::deserialize::<AtpMessage>(&p) {
+                                        Ok(msg) => {
+                                            tracing::info!("[CONN] RX: snap deserialized {:?}", std::mem::discriminant(&msg));
+                                            self.process_message(msg, &ctx, &peers, &peer_id, &writer, &sync_in_progress, &shared_secret).await;
+                                            continue;
+                                        }
+                                        Err(e) => tracing::warn!("[CONN] RX: snap deserialize FAIL: {:?}", e),
+                                    }
+                                }
+                                None => tracing::warn!("[CONN] RX: both decrypt FAILED"),
                             }
                         }
-                        Err(_) => break,
+                        Err(e) => {
+                            tracing::warn!("[CONN] RX: read error: {}", e);
+                            break;
+                        }
                     }
                 }
             }
         }
+        tracing::info!("[CONN] ACTIVE LOOP END");
         keepalive_handle.abort();
-        sync_handle.abort();
         self.peers.remove_peer(&peer_id);
-        tracing::info!("[ATP] Disconnected: {} (peers left: {})", hex::encode(&peer_id), self.peers.peer_count());
     }
 
-    async fn send_status(send_cipher: &Arc<TokioMutex<AtpCipher>>, ctx: &Arc<SyncContext>, writer: &mut WriteHalf<TcpStream>, _peer_id: &[u8; 20]) {
-        let ctx2 = ctx.clone();
-        let my_status = tokio::task::spawn_blocking(move || create_status(&ctx2)).await.unwrap();
-        let data = bincode::serialize(&my_status).unwrap_or_default();
+    async fn process_message(
+        &mut self,
+        msg: AtpMessage,
+        ctx: &Arc<SyncContext>,
+        peers: &Arc<PeersManager>,
+        peer_id: &[u8; 20],
+        writer: &Arc<TokioMutex<WriteHalf<TcpStream>>>,
+        sync_in_progress: &Arc<AtomicBool>,
+        shared_secret: &[u8; 32],
+    ) {
+        tracing::info!("[CONN] PROCESS {:?}", std::mem::discriminant(&msg));
+        match &msg {
+            AtpMessage::SnapshotRequest => {
+                tracing::info!("[CONN] PROCESS SnapshotRequest");
+                let (height, utxo_data, block_hash) = {
+                    let val = ctx.validator.lock().unwrap();
+                    let utxo = val.utxo_set();
+                    (val.last_block_height(),
+                     bincode::serialize(&utxo.clone()).unwrap_or_default(),
+                     val.last_block_hash().0)
+                };
+                let mut w = writer.lock().await;
+                let snap = SnapshotCipher::new(shared_secret);
+                if let Err(e) = snap.send_snapshot_response(&mut *w, height, utxo_data, block_hash).await {
+                    tracing::warn!("[CONN] SnapshotResponse failed: {}", e);
+                }
+                return;
+            }
+
+            AtpMessage::Status { height, .. } => {
+                self.peer_height = *height;
+                let our_h = { ctx.validator.lock().unwrap().last_block_height() };
+                tracing::info!("[CONN] Status: peer_h={}, our_h={}", height, our_h);
+                if *height > our_h {
+                    let phase = ctx.sync_phase.lock().clone();
+                    if phase == SyncPhase::Idle || phase == SyncPhase::Synced {
+                        sync_in_progress.store(true, Ordering::SeqCst);
+                        let mut dispatcher = SyncDispatcher::new(ctx.clone(), peers.clone(), *peer_id);
+                        dispatcher.set_peer_height(*height);
+                        let sip = sync_in_progress.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = dispatcher.start_sync().await {
+                                tracing::warn!("[CONN] SyncDispatcher failed: {}", e);
+                            }
+                            sip.store(false, Ordering::SeqCst);
+                        });
+                    }
+                    return;
+                }
+            }
+
+            AtpMessage::Pong { .. } => return,
+            AtpMessage::Ping { nonce } => {
+                self.enqueue_msg(&AtpMessage::Pong { nonce: *nonce });
+                return;
+            }
+            AtpMessage::PeerList { ref addrs } => {
+                let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                PeerExchange::process_peer_list(addrs, peers, n);
+                return;
+            }
+            AtpMessage::HeaderRequest { from, to } => {
+                let resp = {
+                    let st = ctx.storage.lock().unwrap();
+                    let mut headers = Vec::new();
+                    for h in *from..=*to {
+                        if let Ok(Some(block)) = st.load_genesis_block(h) {
+                            headers.push(BlockHeader {
+                                height: block.height, block_hash: block.block_hash.0,
+                                prev_hash: block.prev_hash.0,
+                                poh_tick_start: block.poh_tick_start,
+                                poh_tick_end: block.poh_tick_end,
+                                state_root: block.state_root.0,
+                                total_supply: block.total_supply,
+                            });
+                        }
+                    }
+                    AtpMessage::HeaderResponse { headers }
+                };
+                self.enqueue_msg(&resp);
+                return;
+            }
+            _ => {}
+        }
+        handle_atp_message(msg, ctx, peer_id, peers);
+    }
+
+    async fn send_msg(send_cipher: &Arc<TokioMutex<AtpCipher>>, msg: &AtpMessage, writer: &mut WriteHalf<TcpStream>) {
+        let data = bincode::serialize(msg).unwrap_or_default();
         let encrypted = send_cipher.lock().await.encrypt(&data);
         let len = (encrypted.len() as u32).to_be_bytes();
         let mut packet = Vec::with_capacity(4 + encrypted.len());
         packet.extend_from_slice(&len); packet.extend_from_slice(&encrypted);
-        let _ = writer.write_all(&packet).await; let _ = writer.flush().await;
+        let _ = writer.write_all(&packet).await;
+        let _ = writer.flush().await;
     }
 
     async fn read_msg(reader: &mut ReadHalf<TcpStream>) -> Result<Vec<u8>, std::io::Error> {
         let mut len_buf = [0u8; 4];
         reader.read_exact(&mut len_buf).await?;
         let len = u32::from_be_bytes(len_buf) as usize;
-        if len > 10 * 1024 * 1024 { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "too large")); }
+        tracing::info!("[CONN] read_msg: len={}", len);
+        if len > 10 * 1024 * 1024 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "too large"));
+        }
         let mut encrypted = vec![0u8; len];
         reader.read_exact(&mut encrypted).await?;
         Ok(encrypted)

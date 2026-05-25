@@ -11,7 +11,7 @@ use aevum_node::mempool::Mempool;
 use aevum_node::storage::Storage;
 use aevum_node::sync::ChainSync;
 use aevum_node::p2p::peers::PeersManager;
-use aevum_node::p2p::sync::{AtpMessage, SyncContext, create_status, handle_atp_message, flush_block_buffer};
+use aevum_node::p2p::sync::{AtpMessage, SyncContext, SyncPhase, create_status, handle_atp_message, flush_block_buffer, check_sync_timeouts};
 use aevum_node::p2p::noise::{AtpCipher, TofuStore};
 use aevum_node::p2p::connection::AtpConnection;
 use aevum_node::p2p::pex::PeerExchange;
@@ -50,7 +50,7 @@ fn create_genesis_block() -> Block {
 }
 
 #[derive(Parser)]
-#[command(name = "aevum-node", version = "0.6.2")]
+#[command(name = "aevum-node", version = "0.7.0")]
 struct Cli {
     #[arg(long, default_value = "0.0.0.0:9733")] listen_addr: String,
     #[arg(long, default_value = "")] bootstrap_peers: String,
@@ -106,12 +106,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let storage = Arc::new(StdMutex::new(Storage::open(&cli.db_path)?.with_encryption(&miner_pubkey.to_bytes())));
 
     let builtin_genesis = create_genesis_block();
+    let mut validator = Validator::new(b"aevum_genesis_seed");
     {
         let mut st = storage.lock().unwrap();
         if st.max_genesis_height()?.is_none() {
             if cli.bootstrap_mode {
                 st.save_genesis_block(&builtin_genesis)?;
-                tracing::info!("[GENESIS] Bootstrap genesis created: hash={}", builtin_genesis.block_hash.to_hex());
+                let mut g = builtin_genesis.clone();
+                if validator.validate_and_apply(&mut g).is_ok() {
+                    tracing::info!("[GENESIS] Bootstrap genesis applied: hash={}", g.block_hash.to_hex());
+                }
             } else {
                 tracing::info!("[GENESIS] No genesis yet — will download from peers");
             }
@@ -130,12 +134,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|b| bincode::deserialize::<u64>(&b).unwrap_or(0)).unwrap_or(0);
     let serial_counter = Arc::new(StdMutex::new(serial_counter));
 
-    let mut validator = Validator::new(b"aevum_genesis_seed");
     if let Some(snap) = storage.lock().unwrap().load_metadata(POH_SNAPSHOT_KEY)? {
         if let Ok(snap) = bincode::deserialize::<PohSnapshot>(&snap) { validator.restore_poh_from_snapshot(&snap); }
     }
     let utxo_set = storage.lock().unwrap().load_utxo_set().unwrap_or_else(|_| UtxoSet::new());
-    if utxo_set.is_empty() {
+    if utxo_set.is_empty() && max_height > 0 {
         let mut temp_val = Validator::new(b"aevum_genesis_seed");
         for h in 0..=max_height {
             if let Ok(Some(mut block)) = storage.lock().unwrap().load_genesis_block(h) {
@@ -147,16 +150,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(lb) = storage.lock().unwrap().load_genesis_block(max_height)? {
             validator.set_last_block(lb.block_hash, lb.height, lb.poh_tick_end);
         }
-    } else {
+    } else if !utxo_set.is_empty() {
         validator.load_utxo_set(utxo_set);
         validator.genesis_applied = true;
         if let Some(lb) = storage.lock().unwrap().load_genesis_block(max_height)? {
             validator.set_last_block(lb.block_hash, lb.height, lb.poh_tick_end);
-        }
-        if validator.utxo_set().total_supply() == 0 {
-            if let Ok(Some(lb)) = storage.lock().unwrap().load_genesis_block(max_height) {
-                validator.utxo_set_mut().set_total_supply(lb.total_supply);
-            }
         }
     }
 
@@ -183,10 +181,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         chain_sync: chain_sync.clone(), block_buffer: block_buffer.clone(),
         replication: Some(replication.clone()), dht: dht.clone(),
         orchestrator: orchestrator.clone(), network_height: network_height.clone(),
+        sync_phase: Arc::new(parking_lot::Mutex::new(SyncPhase::Idle)),
+        sync_peer: Arc::new(parking_lot::Mutex::new(None)),
     });
 
     let shutdown = Arc::new(AtomicBool::new(false));
     ctrlc::set_handler({ let s = shutdown.clone(); move || { tracing::info!("Ctrl+C"); s.store(true, Ordering::SeqCst); } }).expect("Ctrl+C handler");
+
+    // Sync Timeout Checker
+    let tm_ctx = sync_ctx.clone(); let tm_peers = peers.clone(); let tm_shutdown = shutdown.clone();
+    std::thread::spawn(move || {
+        while !tm_shutdown.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_secs(5));
+            check_sync_timeouts(&tm_ctx, &tm_peers);
+        }
+    });
 
     // ATP ПОТОК
     let server_listen_addr = cli.listen_addr.clone();
@@ -243,7 +252,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
-    // HTTP с /balance, /utxos и кешем
+    // HTTP
     let http_port = cli.http_port;
     let mempool_http = mempool.clone(); let validator_http = validator.clone(); let peers_http = peers.clone();
     let shutdown_http = shutdown.clone(); let start_time = Instant::now();
@@ -256,7 +265,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(Some(mut req)) = server.recv_timeout(Duration::from_secs(1)) {
                 let url = req.url().to_string();
                 let method = req.method();
-                
                 if url == "/health" {
                     req.respond(cors_response("{\"status\":\"ok\"}")).ok();
                 } else if url.starts_with("/status") {
@@ -284,7 +292,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let miner_balance = cache.balances.get(&miner_addr).copied().unwrap_or(0) as f64 / 100_000_000.0;
                     let founder_balance = cache.balances.get(founder_addr).copied().unwrap_or(0) as f64 / 100_000_000.0;
                     let total = utxo_set.total_supply() as f64 / 100_000_000.0;
-                    let s = format!("{{\"miner\":\"{}\",\"miner_aev\":{},\"founder_aev\":{},\"total_aev\":{}}}",
+                    let s = format!("{{\"miner\":\"{}\",\"miner_aev\":{:.8},\"founder_aev\":{:.8},\"total_aev\":{:.8}}}",
                         &miner_addr[..16], miner_balance, founder_balance, total);
                     req.respond(cors_response(&s)).ok();
                 } else if url.starts_with("/utxos") {
@@ -294,7 +302,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut result = String::from("[");
                     for (_, u) in utxo_set.all() {
                         if addr_param.is_empty() || hex::encode(u.owner().to_bytes()).starts_with(addr_param) {
-                            result.push_str(&format!("{{\"amount\":{},\"height\":{},\"tx_hash\":\"{}\",\"nullifier\":\"{}\",\"output_index\":{}}},", u.amount(), u.created_height(), hex::encode(u.tx_hash().as_bytes()), hex::encode(u.nullifier().as_bytes()), u.output_index()));
+                            result.push_str(&format!("{{\"amount\":{},\"height\":{},\"tx_hash\":\"{}\",\"nullifier\":\"{}\",\"output_index\":{}}},",
+                                u.amount(), u.created_height(), hex::encode(u.tx_hash().as_bytes()), hex::encode(u.nullifier().as_bytes()), u.output_index()));
                         }
                     }
                     if result.ends_with(',') { result.pop(); }
@@ -323,29 +332,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let atp_peers2 = peers.clone(); let dht2 = dht.clone();
         let connect_tx_mining = connect_tx.clone();
         let bootstrap_addrs: Vec<String> = vec!["186.246.14.202:9733".to_string(), "82.127.255.223:9733".to_string()];
+        let genesis_requested = Arc::new(AtomicBool::new(false));
+        let gr = genesis_requested.clone();
         std::thread::spawn(move || {
             while !shm.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_secs(1));
                 let network_h = *nh.lock().unwrap();
                 let our_h = vm.lock().unwrap().last_block_height();
                 let peer_count = pm.peer_count();
+                
+                // Проверка генезиса — всегда отпускаем val перед любым continue
                 {
-                    let mut val = vm.lock().unwrap();
+                    let val = vm.lock().unwrap();
                     if !val.genesis_applied {
                         let st = sm.lock().unwrap();
                         if let Ok(Some(genesis)) = st.load_genesis_block(0) {
                             drop(st);
+                            drop(val);
+                            // Применяем генезис с новым локом
+                            let mut v = vm.lock().unwrap();
                             let mut g = genesis.clone();
-                            if val.validate_and_apply(&mut g).is_ok() {
-                                val.last_block_hash = genesis.block_hash;
-                                drop(val);
-                                flush_block_buffer(&s_m);
-                                continue;
+                            if v.validate_and_apply(&mut g).is_ok() {
+                                v.last_block_hash = genesis.block_hash;
+                                tracing::info!("⛓️ Genesis self-applied: hash={}", genesis.block_hash.to_hex());
+                            }
+                            drop(v);
+                            flush_block_buffer(&s_m);
+                            continue;
+                        } else {
+                            drop(st);
+                            if peer_count > 0 && !gr.load(Ordering::SeqCst) {
+                                gr.store(true, Ordering::SeqCst);
+                                tracing::info!("[GENESIS] Requesting block 0 from peers...");
+                                let req = AtpMessage::HeaderRequest { from: 0, to: 0 };
+                                if let Ok(data) = bincode::serialize(&req) { pm.broadcast(data); }
                             }
                         }
+                        continue;
                     }
-                    if !val.genesis_applied { continue; }
+                    // val дропается здесь
                 }
+                
                 if peer_count < MIN_PEERS && lpd.lock().unwrap().elapsed().as_secs() > PEER_DISCOVERY_INTERVAL {
                     *lpd.lock().unwrap() = Instant::now();
                     for addr_str in &bootstrap_addrs {
@@ -364,7 +391,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+                
                 if peer_count > 0 && our_h < network_h { continue; }
+                
                 let mut val = vm.lock().unwrap();
                 let mut mem = mm.lock().unwrap();
                 val.tick_poh();
@@ -375,6 +404,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let txs_backup = if should_mine { mem.take_batch(100) } else { vec![] };
                 let height = val.last_block_height() + 1;
                 drop(mem); drop(val);
+                
                 if should_mine {
                     let mut val = vm.lock().unwrap();
                     let mut st = sm.lock().unwrap();
@@ -419,7 +449,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    tracing::info!("🚀 Aevum Node v0.6.2 — ATP Protocol");
+    tracing::info!("🚀 Aevum Node v0.7.0 — ATP Protocol");
     while !shutdown.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_secs(1)); }
     Ok(())
 }

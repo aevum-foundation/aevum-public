@@ -3,6 +3,8 @@ pub mod gossip;
 pub mod noise;
 pub mod peers;
 pub mod sync;
+pub mod sync_dispatcher;
+pub mod snapshot_cipher;
 
 use aevum::consensus::validator::Validator;
 use crate::mempool::Mempool;
