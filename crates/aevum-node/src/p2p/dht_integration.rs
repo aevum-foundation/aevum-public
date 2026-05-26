@@ -1,7 +1,7 @@
 use crate::p2p::dht::{Dht, DhtNode};
 use crate::p2p::peers::PeersManager;
 use crate::p2p::sync::AtpMessage;
-use crate::p2p::pex::PeerExchange;
+use crate::p2p::pex;
 use std::sync::Arc;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -44,7 +44,7 @@ impl DhtIntegration {
         let nodes = self.dht.random_nodes(20, now, self.peer_timeout_secs);
         let addrs: Vec<([u8; 16], u16)> = nodes
             .into_iter()
-            .map(|n| PeerExchange::socket_to_bytes(&n.addr))
+            .map(|n| pex::socket_to_bytes(&n.addr))
             .collect();
         AtpMessage::PeerList { addrs }
     }
@@ -54,7 +54,7 @@ impl DhtIntegration {
         let mut added = 0;
         let now = Self::now_secs();
         for (ip_bytes, port) in addrs {
-            if let Some(addr) = PeerExchange::bytes_to_socket(*ip_bytes, *port) {
+            if let Some(addr) = pex::bytes_to_socket(*ip_bytes, *port) {
                 if self.peers.can_accept(&addr) {
                     let mut node_id = [0u8; 32];
                     let hash = blake3::hash(addr.to_string().as_bytes());

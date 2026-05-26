@@ -67,3 +67,4 @@ pub use noise::AtpCipher as NoiseCipher;
 pub mod pex;
 pub mod chain_orchestrator;
 pub mod genesis_sync;
+pub mod dht_integration;

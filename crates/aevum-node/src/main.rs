@@ -16,6 +16,7 @@ use aevum_node::p2p::noise::{AtpCipher, TofuStore};
 use aevum_node::p2p::connection::AtpConnection;
 use aevum_node::p2p::pex::PeerExchange;
 use aevum_node::p2p::dht::Dht;
+use aevum_node::p2p::dht_integration::DhtIntegration;
 use aevum_node::p2p::snapshots::SnapshotManager;
 use aevum_node::encrypted_replication::EncryptedReplication;
 use aevum_node::p2p::chain_orchestrator::ChainOrchestrator;
@@ -176,6 +177,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_peers_list: Vec<String> = if cli.bootstrap_peers.is_empty() { vec![] } else { cli.bootstrap_peers.split(',').map(|s| s.trim().to_string()).collect() };
     let balance_cache = Arc::new(StdMutex::new(BalanceCache { balances: BTreeMap::new(), last_update: Instant::now() }));
 
+    // Создаём DhtIntegration для авто-поиска пиров
+    let listen_addr_parsed: SocketAddr = cli.listen_addr.parse().unwrap_or_else(|_| "0.0.0.0:9733".parse().unwrap());
+    let our_node_id: [u8; 32] = blake3::hash(&miner_pubkey.to_bytes()).into();
+    let dht_integration = Arc::new(StdMutex::new(DhtIntegration::new(our_node_id, listen_addr_parsed, peers.clone())));
+
     let sync_ctx = Arc::new(SyncContext {
         validator: validator.clone(), storage: storage.clone(),
         chain_sync: chain_sync.clone(), block_buffer: block_buffer.clone(),
@@ -216,7 +222,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if retry > 0 { tokio::time::sleep(Duration::from_secs(5 * (retry + 1) as u64)).await; }
                                 match aevum_node::p2p::peers::dial_peer(addr, dk.clone(), &dt).await {
                                     Ok((cipher, peer_id, reader, writer)) => {
-                                        tracing::info!("[ATP] ✅ Bootstrap CONNECTED to {}", addr);
+                                        tracing::info!("[ATP] ✅Bootstrap CONNECTED to {}", addr);
                                         let conn = AtpConnection::new(cipher, peer_id, addr, dp.clone(), dc.clone(), false);
                                         let conn_handle = tokio::spawn(async move { conn.run(reader, writer).await; });
                                         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -353,7 +359,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // МАЙНИНГ + АВТО-ПЕРЕПОДКЛЮЧЕНИЕ
+    // МАЙНИНГ + АВТО-ПЕРЕПОДКЛЮЧЕНИЕ ЧЕРЕЗ DHT
     let (connect_tx, mut connect_rx) = tokio_mpsc::unbounded_channel::<ConnectCommand>();
     if let Some(mk) = load_miner_key(&cli)? {
         let vm = validator.clone(); let mm = mempool.clone(); let sm = storage.clone();
@@ -362,7 +368,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let atp_key2 = our_key.clone(); let atp_tofu2 = tofu.clone(); let atp_ctx2 = sync_ctx.clone();
         let atp_peers2 = peers.clone(); let dht2 = dht.clone();
         let connect_tx_mining = connect_tx.clone();
-        let bootstrap_addrs: Vec<String> = vec!["186.246.14.202:9733".to_string(), "82.127.255.223:9733".to_string()];
+        let dht_int = dht_integration.clone();
         let genesis_requested = Arc::new(AtomicBool::new(false));
         let gr = genesis_requested.clone();
         std::thread::spawn(move || {
@@ -396,13 +402,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
                 }
+                // АВТО-ПЕРЕПОДКЛЮЧЕНИЕ ЧЕРЕЗ DHT
                 if peer_count < MIN_PEERS && lpd.lock().unwrap().elapsed().as_secs() > PEER_DISCOVERY_INTERVAL {
                     *lpd.lock().unwrap() = Instant::now();
-                    for addr_str in &bootstrap_addrs {
-                        if let Ok(addr) = addr_str.parse::<SocketAddr>() {
-                            if pm.can_connect_to(&addr) {
-                                pm.mark_connecting(addr);
-                                let _ = connect_tx_mining.send(ConnectCommand { addr, our_key: atp_key2.clone(), tofu: atp_tofu2.clone(), peers: atp_peers2.clone(), ctx: atp_ctx2.clone() });
+                    // Берём кандидатов из DHT
+                    let candidates = dht_int.lock().unwrap().get_bootstrap_candidates();
+                    if !candidates.is_empty() {
+                        for addr in &candidates {
+                            if pm.can_connect_to(addr) {
+                                pm.mark_connecting(*addr);
+                                let _ = connect_tx_mining.send(ConnectCommand { addr: *addr, our_key: atp_key2.clone(), tofu: atp_tofu2.clone(), peers: atp_peers2.clone(), ctx: atp_ctx2.clone() });
+                            }
+                        }
+                    } else {
+                        // Если DHT пуст — используем bootstrap из параметров
+                        let fallback_addrs: Vec<&str> = vec!["186.246.14.202:9733"];
+                        for addr_str in &fallback_addrs {
+                            if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+                                if pm.can_connect_to(&addr) {
+                                    pm.mark_connecting(addr);
+                                    let _ = connect_tx_mining.send(ConnectCommand { addr, our_key: atp_key2.clone(), tofu: atp_tofu2.clone(), peers: atp_peers2.clone(), ctx: atp_ctx2.clone() });
+                                }
                             }
                         }
                     }
@@ -451,6 +471,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+
+    // Подключение к пирам из DHT (фоновый поток)
+    let atp_key3 = our_key.clone(); let atp_tofu3 = tofu.clone(); let atp_peers3 = peers.clone(); let atp_ctx3 = sync_ctx.clone();
+    let dht_int_connect = dht_integration.clone(); let shutdown_connect = shutdown.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async move {
+            while let Some(cmd) = connect_rx.recv().await {
+                if shutdown_connect.load(Ordering::SeqCst) { break; }
+                match aevum_node::p2p::peers::dial_peer(cmd.addr, cmd.our_key, &cmd.tofu).await {
+                    Ok((cipher, peer_id, reader, writer)) => {
+                        tracing::info!("[DHT] Connected to peer {}", cmd.addr);
+                        // Добавляем в DHT
+                        let mut node_id = [0u8; 32];
+                        let hash = blake3::hash(cmd.addr.to_string().as_bytes());
+                        node_id.copy_from_slice(&hash.as_bytes()[..32]);
+                        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                        cmd.ctx.dht.lock().unwrap().add_or_update(node_id, cmd.addr, now);
+                        let conn = AtpConnection::new(cipher, peer_id, cmd.addr, cmd.peers.clone(), cmd.ctx.clone(), false);
+                        let _ = tokio::spawn(async move { conn.run(reader, writer).await; }).await;
+                    }
+                    Err(e) => tracing::warn!("[DHT] Connect failed {}: {}", cmd.addr, e),
+                }
+            }
+        });
+    });
 
     // Heartbeat
     let hb_ctx = sync_ctx.clone(); let hb_peers = peers.clone(); let shutdown_hb = shutdown.clone();
