@@ -39,6 +39,7 @@ const GENESIS_ADDRESS: &str = "0ffc25780ab973a85612aad6f0b7abb35bd3fd2222387de03
 const GENESIS_AMOUNT: u64 = 21_000_000 * 100_000_000;
 const MIN_PEERS: usize = 2;
 const PEER_DISCOVERY_INTERVAL: u64 = 15;
+const ORCHESTRATOR_INTERVAL: u64 = 30;
 
 fn create_genesis_block() -> Block {
     let addr_bytes = hex::decode(GENESIS_ADDRESS).expect("Invalid genesis address");
@@ -177,7 +178,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_peers_list: Vec<String> = if cli.bootstrap_peers.is_empty() { vec![] } else { cli.bootstrap_peers.split(',').map(|s| s.trim().to_string()).collect() };
     let balance_cache = Arc::new(StdMutex::new(BalanceCache { balances: BTreeMap::new(), last_update: Instant::now() }));
 
-    // Создаём DhtIntegration для авто-поиска пиров
     let listen_addr_parsed: SocketAddr = cli.listen_addr.parse().unwrap_or_else(|_| "0.0.0.0:9733".parse().unwrap());
     let our_node_id: [u8; 32] = blake3::hash(&miner_pubkey.to_bytes()).into();
     let dht_integration = Arc::new(StdMutex::new(DhtIntegration::new(our_node_id, listen_addr_parsed, peers.clone())));
@@ -366,7 +366,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let dam = developer_address; let sc = serial_counter.clone(); let shm = shutdown.clone(); let pm = peers.clone(); let s_m = sync_ctx.clone();
         let nh = network_height.clone(); let lpd = last_peer_discovery.clone();
         let atp_key2 = our_key.clone(); let atp_tofu2 = tofu.clone(); let atp_ctx2 = sync_ctx.clone();
-        let atp_peers2 = peers.clone(); let dht2 = dht.clone();
+        let atp_peers2 = peers.clone();
         let connect_tx_mining = connect_tx.clone();
         let dht_int = dht_integration.clone();
         let genesis_requested = Arc::new(AtomicBool::new(false));
@@ -405,7 +405,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // АВТО-ПЕРЕПОДКЛЮЧЕНИЕ ЧЕРЕЗ DHT
                 if peer_count < MIN_PEERS && lpd.lock().unwrap().elapsed().as_secs() > PEER_DISCOVERY_INTERVAL {
                     *lpd.lock().unwrap() = Instant::now();
-                    // Берём кандидатов из DHT
                     let candidates = dht_int.lock().unwrap().get_bootstrap_candidates();
                     if !candidates.is_empty() {
                         for addr in &candidates {
@@ -415,7 +414,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     } else {
-                        // Если DHT пуст — используем bootstrap из параметров
                         let fallback_addrs: Vec<&str> = vec!["186.246.14.202:9733"];
                         for addr_str in &fallback_addrs {
                             if let Ok(addr) = addr_str.parse::<SocketAddr>() {
@@ -461,6 +459,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let mut v = vm.lock().unwrap(); let mut s = sm.lock().unwrap();
                                 let _ = orch.process_chain(&mut v, &mut s);
                             }
+                            // 🔧 ШЛЁМ STATUS ПРИ НОВОМ БЛОКЕ (как Bitcoin/Ethereum)
                             let status = create_status(&s_m);
                             if let Ok(data) = bincode::serialize(&status) { pm.broadcast(data); }
                             tracing::info!("⛏️  Mined block {}", height);
@@ -483,7 +482,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match aevum_node::p2p::peers::dial_peer(cmd.addr, cmd.our_key, &cmd.tofu).await {
                     Ok((cipher, peer_id, reader, writer)) => {
                         tracing::info!("[DHT] Connected to peer {}", cmd.addr);
-                        // Добавляем в DHT
                         let mut node_id = [0u8; 32];
                         let hash = blake3::hash(cmd.addr.to_string().as_bytes());
                         node_id.copy_from_slice(&hash.as_bytes()[..32]);
@@ -496,6 +494,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         });
+    });
+
+    // ОРКЕСТРАТОР — фоновый поток
+    let orch_v = validator.clone(); let orch_nh = network_height.clone();
+    let orch_peers = peers.clone(); let orch_orch = orchestrator.clone(); let orch_shutdown = shutdown.clone();
+    std::thread::spawn(move || {
+        while !orch_shutdown.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_secs(ORCHESTRATOR_INTERVAL));
+            let our_h = orch_v.lock().unwrap().last_block_height();
+            let nh = *orch_nh.lock().unwrap();
+            tracing::info!("[ORCH] tick: our={}, network={}", our_h, nh);
+            let mut orch = orch_orch.lock().unwrap();
+            if nh > our_h + 50 {
+                tracing::info!("[ORCH] Network ahead: us={}, network={}, diff={}. Requesting sync...", our_h, nh, nh - our_h);
+                let req = AtpMessage::HeaderRequest { from: our_h + 1, to: nh };
+                if let Ok(data) = bincode::serialize(&req) {
+                    orch_peers.broadcast(data);
+                    tracing::info!("[ORCH] HeaderRequest broadcast {}-{}", our_h + 1, nh);
+                }
+            } else if our_h > nh + 10 {
+                tracing::info!("[ORCH] We are ahead: us={}, network={}", our_h, nh);
+            }
+        }
     });
 
     // Heartbeat
