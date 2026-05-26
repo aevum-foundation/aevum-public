@@ -101,6 +101,7 @@ impl AtpConnection {
         }
 
         let our_h = { ctx.validator.lock().unwrap().last_block_height() };
+
         let pex_msg = PeerExchange::create_peer_list(&self.peers, 20);
         self.enqueue_msg(&pex_msg);
 
@@ -204,6 +205,15 @@ impl AtpConnection {
     ) {
         match &msg {
             AtpMessage::SnapshotRequest => {
+                let mut phase = ctx.sync_phase.lock();
+                if matches!(*phase, SyncPhase::Idle | SyncPhase::Synced) {
+                    *phase = SyncPhase::AwaitingSnapshot {
+                        peer_id: *peer_id,
+                        request_time: Instant::now(),
+                    };
+                }
+                drop(phase);
+
                 let (height, utxo_data, block_hash) = {
                     let val = ctx.validator.lock().unwrap();
                     let utxo = val.utxo_set();
@@ -215,24 +225,63 @@ impl AtpConnection {
                 let snap = SnapshotCipher::new(shared_secret);
                 if let Err(e) = snap.send_snapshot_response(&mut *w, height, utxo_data, block_hash).await {
                     tracing::warn!("[CONN] SnapshotResponse failed: {}", e);
+                    let mut phase = ctx.sync_phase.lock();
+                    if matches!(*phase, SyncPhase::AwaitingSnapshot { .. }) {
+                        *phase = SyncPhase::Idle;
+                    }
                 }
                 return;
             }
 
             AtpMessage::SnapshotResponse { height, utxo_data, block_hash } => {
                 tracing::info!("[CONN] PROCESS SnapshotResponse h={}", *height);
+
                 let mut val = ctx.validator.lock().unwrap();
-                if !val.genesis_applied {
+                let applied = if !val.genesis_applied {
                     if let Ok(utxo) = bincode::deserialize::<UtxoSet>(utxo_data) {
                         val.load_utxo_set(utxo);
                         val.genesis_applied = true;
                         val.set_last_block(Hash(*block_hash), *height, 0);
                         ctx.storage.lock().unwrap().save_utxo_set(val.utxo_set()).ok();
                         tracing::info!("[CONN] Snapshot applied: h={}, supply={}", height, val.utxo_set().total_supply());
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                drop(val);
+
+                if applied {
+                    crate::p2p::sync::flush_block_buffer(ctx);
+
+                    let our_h = ctx.validator.lock().unwrap().last_block_height();
+                    let nh = *ctx.network_height.lock().unwrap();
+                    let mut phase = ctx.sync_phase.lock();
+
+                    if our_h >= nh {
+                        *phase = SyncPhase::Synced;
+                        tracing::info!("[CONN] SyncPhase -> Synced (snapshot complete, h={})", our_h);
+                    } else {
+                        let from = our_h + 1;
+                        *phase = SyncPhase::AwaitingHeaders {
+                            peer_id: *peer_id,
+                            from,
+                            to: nh,
+                            request_time: Instant::now(),
+                            retries: 0,
+                        };
+                        tracing::info!("[CONN] SyncPhase -> AwaitingHeaders {}-{}", from, nh);
+                        let req = AtpMessage::HeaderRequest { from, to: nh };
+                        self.enqueue_msg(&req);
+                    }
+                } else {
+                    let mut phase = ctx.sync_phase.lock();
+                    if matches!(*phase, SyncPhase::AwaitingSnapshot { .. }) {
+                        *phase = SyncPhase::Idle;
                     }
                 }
-                drop(val);
-                crate::p2p::sync::flush_block_buffer(ctx);
                 return;
             }
 
@@ -240,7 +289,6 @@ impl AtpConnection {
                 self.peer_height = *height;
                 return;
             }
-
             AtpMessage::Pong { .. } => return,
             AtpMessage::Ping { nonce } => {
                 self.enqueue_msg(&AtpMessage::Pong { nonce: *nonce });
