@@ -39,6 +39,7 @@ impl AtpNode {
             network_height: Arc::new(StdMutex::new(0)),
             sync_phase: Arc::new(parking_lot::Mutex::new(SyncPhase::Idle)),
             sync_peer: Arc::new(parking_lot::Mutex::new(None)),
+            pending_solo_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
         });
 
         Ok(Self { peers, sync_ctx, listen_addr: listen_addr.to_string(), bootstrap_peers: bootstrap_peers.to_string() })
