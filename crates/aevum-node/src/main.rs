@@ -212,7 +212,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Orchestrator Loop
     aevum_node::orchestrator_loop::start(
         validator.clone(), storage.clone(), network_height.clone(),
-        peers.clone(), orchestrator.clone(), shutdown.clone(),
+        peers.clone(), orchestrator.clone(), sync_ctx.sync_phase.clone(), shutdown.clone(),
     );
 
     // Heartbeat
