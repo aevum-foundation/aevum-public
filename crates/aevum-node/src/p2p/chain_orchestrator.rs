@@ -74,10 +74,8 @@ impl ForkQueue {
     fn max_size(&self) -> usize { BASE_FORK_QUEUE_SIZE.max(self.peer_counts.len() * 2) }
 
     fn push(&mut self, c: ForkCandidate) -> Result<(), OrchestratorError> {
-        // Проверяем лимит на пира — если превышен, ищем индекс для замены до мутации
         let peer_cnt = self.peer_counts.get(&c.peer_id).copied().unwrap_or(0);
         if peer_cnt >= MAX_CANDIDATES_PER_PEER {
-            // Ищем индекс самого низкого кандидата этого пира
             let replace_idx: Option<usize> = self.queue.iter().enumerate()
                 .filter(|(_, qc)| qc.peer_id == c.peer_id && qc.total_height < c.total_height)
                 .min_by_key(|(_, qc)| qc.total_height)
@@ -90,8 +88,6 @@ impl ForkQueue {
                 None => return Err(OrchestratorError::ForkQueueFull),
             }
         }
-
-        // Проверяем общий размер очереди
         let max_sz = self.max_size();
         if self.queue.len() >= max_sz {
             let remove_idx: Option<usize> = self.queue.iter().enumerate()
@@ -106,7 +102,6 @@ impl ForkQueue {
                 None => return Err(OrchestratorError::ForkQueueFull),
             }
         }
-
         self.peer_counts.entry(c.peer_id).and_modify(|e| *e += 1).or_insert(1);
         self.queue.push_back(c);
         Ok(())
@@ -340,7 +335,7 @@ impl ChainOrchestrator {
         self.wal.log(st, "accept_solo_chain", blocks.last().map(|b| b.height).unwrap_or(0), None)?;
         self.save_progress(st)?;
 
-        tracing::debug!("[ORCH] Solo chain accepted: peer={}, blocks={}, unique={}, poh_ticks={}, normative_ticks={}, coefficient={:.4}, coinbase_raw={}, fair_reward={} ({} AEV)",
+        tracing::info!("[ORCH] Solo chain accepted: peer={}, blocks={}, unique={}, poh_ticks={}, normative_ticks={}, coefficient={:.4}, coinbase_raw={}, fair_reward={} ({} AEV)",
             hex::encode(peer_id), blocks.len(), unique_blocks, total_poh_ticks, normative_ticks, fairness_coefficient, coinbase_amount, fair_reward, fair_reward as f64 / 100_000_000.0);
         Ok((unique_blocks, fair_reward, fairness_coefficient))
     }

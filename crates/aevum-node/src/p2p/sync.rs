@@ -7,22 +7,46 @@ use crate::storage::Storage;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+// ── Константы ────────────────────────────────────────────────
+const MAX_HEADERS_PER_RESPONSE: usize = 2000;
+const MAX_BLOCKS_PER_RESPONSE: usize = 500;
+const MAX_SOLO_CHAIN_BLOCKS: usize = 1000;
+const SNAPSHOT_TIMEOUT_SECS: u64 = 30;
+const HEADERS_TIMEOUT_SECS: u64 = 15;
+const BLOCKS_TIMEOUT_SECS: u64 = 30;
+const MAX_RETRIES: u8 = 3;
+const PENDING_SOLO_REQUEST_TIMEOUT_SECS: u64 = 60;
+
+// ── Метрики ──────────────────────────────────────────────────
+static SYNC_PHASE_CHANGES: AtomicU64 = AtomicU64::new(0);
+static SYNC_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+static SOLO_CHAINS_PROCESSED: AtomicU64 = AtomicU64::new(0);
+static MESSAGE_LIMIT_REJECTED: AtomicU64 = AtomicU64::new(0);
+static PENDING_SOLO_REQUESTS_CLEANED: AtomicU64 = AtomicU64::new(0);
+
+pub fn sync_metrics() -> (u64, u64, u64, u64, u64) {
+    (SYNC_PHASE_CHANGES.load(Ordering::Relaxed),
+     SYNC_TIMEOUTS.load(Ordering::Relaxed),
+     SOLO_CHAINS_PROCESSED.load(Ordering::Relaxed),
+     MESSAGE_LIMIT_REJECTED.load(Ordering::Relaxed),
+     PENDING_SOLO_REQUESTS_CLEANED.load(Ordering::Relaxed))
+}
+
+// ── Фазы синхронизации ──────────────────────────────────────
 #[derive(Clone, Debug, PartialEq)]
 pub enum SyncPhase {
     Idle,
     AwaitingSnapshot { peer_id: [u8; 20], request_time: Instant },
     AwaitingHeaders { peer_id: [u8; 20], from: u64, to: u64, request_time: Instant, retries: u8 },
     AwaitingBlocks { peer_id: [u8; 20], from: u64, to: u64, request_time: Instant, retries: u8 },
+    AwaitingSoloBlocks { peer_id: [u8; 20], request_time: Instant },
     Synced,
 }
 
-const SNAPSHOT_TIMEOUT_SECS: u64 = 30;
-const HEADERS_TIMEOUT_SECS: u64 = 15;
-const BLOCKS_TIMEOUT_SECS: u64 = 30;
-const MAX_RETRIES: u8 = 3;
-
+// ── Структуры ────────────────────────────────────────────────
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlockHeader {
     pub height: u64, pub block_hash: [u8; 32], pub prev_hash: [u8; 32],
@@ -45,6 +69,14 @@ pub enum AtpMessage {
     NodeList { nodes: Vec<([u8; 32], String)> }, Ping { nonce: u64 }, Pong { nonce: u64 },
     SnapshotRequest,
     SnapshotResponse { height: u64, utxo_data: Vec<u8>, block_hash: [u8; 32] },
+    SoloChain { blocks: Vec<(u64, Vec<u8>)> },
+    SoloChainRequest,
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingSoloRequest {
+    pub peer_id: [u8; 20],
+    pub request_time: Instant,
 }
 
 pub struct SyncContext {
@@ -58,8 +90,20 @@ pub struct SyncContext {
     pub network_height: Arc<StdMutex<u64>>,
     pub sync_phase: Arc<parking_lot::Mutex<SyncPhase>>,
     pub sync_peer: Arc<parking_lot::Mutex<Option<[u8; 20]>>>,
+    pub pending_solo_requests: Arc<StdMutex<Vec<PendingSoloRequest>>>,
 }
 
+// ── Проверка лимитов ────────────────────────────────────────
+fn check_message_limits(msg: &AtpMessage) -> Result<(), &'static str> {
+    match msg {
+        AtpMessage::HeaderResponse { headers } if headers.len() > MAX_HEADERS_PER_RESPONSE => Err("too many headers"),
+        AtpMessage::BlockResponse { blocks, .. } if blocks.len() > MAX_BLOCKS_PER_RESPONSE => Err("too many blocks"),
+        AtpMessage::SoloChain { blocks } if blocks.len() > MAX_SOLO_CHAIN_BLOCKS => Err("too many solo blocks"),
+        _ => Ok(()),
+    }
+}
+
+// ── Создание статуса ────────────────────────────────────────
 pub fn create_status(ctx: &SyncContext) -> AtpMessage {
     let val = ctx.validator.lock().unwrap();
     let utxo = val.utxo_set();
@@ -72,10 +116,34 @@ pub fn create_status(ctx: &SyncContext) -> AtpMessage {
     }
 }
 
+// ── Очистка старых pending solo requests ────────────────────
+pub fn cleanup_pending_solo_requests(ctx: &SyncContext) {
+    let mut pending = ctx.pending_solo_requests.lock().unwrap();
+    let before = pending.len();
+    pending.retain(|req| req.request_time.elapsed().as_secs() < PENDING_SOLO_REQUEST_TIMEOUT_SECS);
+    let removed = before - pending.len();
+    if removed > 0 {
+        PENDING_SOLO_REQUESTS_CLEANED.fetch_add(removed as u64, Ordering::Relaxed);
+        tracing::debug!("[SYNC] Cleaned {} expired solo requests", removed);
+    }
+}
+
+// ── Главный обработчик сообщений ───────────────────────────
 pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8; 20], peers: &Arc<PeersManager>) {
+    if let Err(reason) = check_message_limits(&msg) {
+        MESSAGE_LIMIT_REJECTED.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!("[SYNC] Message rejected from {}: {}", hex::encode(peer_id), reason);
+        return;
+    }
+
     match msg {
-        AtpMessage::Status { height, .. } => {
+        AtpMessage::Status { height, version, .. } => {
+            if version != 1 {
+                tracing::warn!("[SYNC] Unsupported version {} from {}", version, hex::encode(peer_id));
+                return;
+            }
             if height > 0 { let mut nh = ctx.network_height.lock().unwrap(); if height > *nh { *nh = height; } }
+            peers.update_peer_height(peer_id, height);
             let my = ctx.validator.lock().unwrap().last_block_height();
             if height <= my { return; }
             let mut phase = ctx.sync_phase.lock();
@@ -89,6 +157,7 @@ pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8
                 let req = AtpMessage::HeaderRequest { from, to: height };
                 if let Ok(data) = bincode::serialize(&req) { peers.send_to(peer_id, data); }
             }
+            SYNC_PHASE_CHANGES.fetch_add(1, Ordering::Relaxed);
         }
         AtpMessage::SnapshotRequest => {}
         AtpMessage::SnapshotResponse { height, utxo_data, block_hash } => {
@@ -105,6 +174,7 @@ pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8
                     let req = AtpMessage::HeaderRequest { from, to: nh };
                     if let Ok(data) = bincode::serialize(&req) { peers.send_to(peer_id, data); }
                 } else { let mut phase = ctx.sync_phase.lock(); *phase = SyncPhase::Synced; }
+                SYNC_PHASE_CHANGES.fetch_add(1, Ordering::Relaxed);
                 flush_block_buffer(ctx);
             }
         }
@@ -120,6 +190,7 @@ pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8
             *phase = SyncPhase::AwaitingBlocks { peer_id: *peer_id, from, to, request_time: Instant::now(), retries: 0 };
             let req = AtpMessage::BlockRequest { request_id: rand::random(), from, to };
             if let Ok(data) = bincode::serialize(&req) { peers.send_to(peer_id, data); }
+            SYNC_PHASE_CHANGES.fetch_add(1, Ordering::Relaxed);
         }
         AtpMessage::BlockRequest { request_id, from, to } => {
             let st = ctx.storage.lock().unwrap();
@@ -139,7 +210,6 @@ pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8
             if val.last_block_height() >= nh { let mut phase = ctx.sync_phase.lock(); *phase = SyncPhase::Synced; }
         }
         AtpMessage::Transaction { bytes, .. } => {
-            // Gossip: рассылаем транзакцию всем пирам
             let gossip_msg = AtpMessage::Transaction { tx_hash: [0u8; 32], ttl: 0, bytes };
             if let Ok(data) = bincode::serialize(&gossip_msg) { peers.broadcast(data); }
         }
@@ -147,16 +217,68 @@ pub fn handle_atp_message(msg: AtpMessage, ctx: &Arc<SyncContext>, peer_id: &[u8
             let pong = AtpMessage::Pong { nonce };
             if let Ok(data) = bincode::serialize(&pong) { peers.send_to(peer_id, data); }
         }
+        AtpMessage::SoloChain { blocks } => {
+            // Проверяем что ответ пришёл от того кому мы отправляли запрос
+            let is_expected = {
+                let pending = ctx.pending_solo_requests.lock().unwrap();
+                pending.iter().any(|req| req.peer_id == *peer_id)
+            };
+            if !is_expected {
+                tracing::warn!("[SYNC] Unsolicited SoloChain from {}", hex::encode(peer_id));
+                return;
+            }
+            ctx.pending_solo_requests.lock().unwrap().retain(|req| req.peer_id != *peer_id);
+
+            let block_count = blocks.len();
+            tracing::info!("[SYNC] Received SoloChain from {}: {} blocks", hex::encode(peer_id), block_count);
+            let block_objs: Vec<Block> = blocks.iter().filter_map(|(_, bytes)| bincode::deserialize(bytes).ok()).collect();
+            if !block_objs.is_empty() {
+                let mut orch = ctx.orchestrator.lock().unwrap();
+                let mut val = ctx.validator.lock().unwrap();
+                let mut st = ctx.storage.lock().unwrap();
+                match orch.accept_solo_chain(peer_id, &block_objs, &mut val, &mut st) {
+                    Ok((count, reward, coeff)) => {
+                        SOLO_CHAINS_PROCESSED.fetch_add(1, Ordering::Relaxed);
+                        tracing::info!("[SYNC] SoloChain accepted: {} blocks, {} AEV reward, coeff={:.4}", count, reward as f64 / 100_000_000.0, coeff);
+                        if let Some(last) = block_objs.last() {
+                            let mut nh = ctx.network_height.lock().unwrap();
+                            if last.height > *nh { *nh = last.height; }
+                        }
+                    }
+                    Err(e) => tracing::warn!("[SYNC] SoloChain rejected: {}", e),
+                }
+            }
+        }
+        AtpMessage::SoloChainRequest => {
+            tracing::info!("[SYNC] SoloChainRequest from {}", hex::encode(peer_id));
+            let st = ctx.storage.lock().unwrap();
+            let mut blocks = Vec::new();
+            let our_h = ctx.validator.lock().unwrap().last_block_height();
+            for h in 1..=our_h {
+                if let Ok(Some(block)) = st.load_my_block(h) {
+                    if let Ok(bytes) = bincode::serialize(&block) { blocks.push((h, bytes)); }
+                }
+            }
+            let block_count = blocks.len();
+            drop(st);
+            if !blocks.is_empty() {
+                let resp = AtpMessage::SoloChain { blocks };
+                if let Ok(data) = bincode::serialize(&resp) { peers.send_to(peer_id, data); }
+                tracing::info!("[SYNC] SoloChain sent to {}: {} blocks", hex::encode(peer_id), block_count);
+            }
+        }
         _ => {}
     }
 }
 
+// ── Таймауты ────────────────────────────────────────────────
 pub fn check_sync_timeouts(ctx: &Arc<SyncContext>, _peers: &Arc<PeersManager>) {
     let mut phase = ctx.sync_phase.lock();
     match phase.clone() {
         SyncPhase::AwaitingSnapshot { .. } => {}
         SyncPhase::AwaitingHeaders { peer_id, from, to, request_time, retries } => {
             if request_time.elapsed().as_secs() > HEADERS_TIMEOUT_SECS {
+                SYNC_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                 if retries < MAX_RETRIES {
                     *phase = SyncPhase::AwaitingHeaders { peer_id, from, to, request_time: Instant::now(), retries: retries + 1 };
                     let req = AtpMessage::HeaderRequest { from, to };
@@ -166,6 +288,7 @@ pub fn check_sync_timeouts(ctx: &Arc<SyncContext>, _peers: &Arc<PeersManager>) {
         }
         SyncPhase::AwaitingBlocks { peer_id, from, to, request_time, retries } => {
             if request_time.elapsed().as_secs() > BLOCKS_TIMEOUT_SECS {
+                SYNC_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                 if retries < MAX_RETRIES {
                     *phase = SyncPhase::AwaitingBlocks { peer_id, from, to, request_time: Instant::now(), retries: retries + 1 };
                     let req = AtpMessage::BlockRequest { request_id: rand::random(), from, to };
@@ -177,33 +300,53 @@ pub fn check_sync_timeouts(ctx: &Arc<SyncContext>, _peers: &Arc<PeersManager>) {
     }
 }
 
+// ── Пакетная обработка блоков ──────────────────────────────
 pub fn flush_block_buffer(ctx: &SyncContext) {
-    let mut val = ctx.validator.lock().unwrap();
-    if !val.genesis_applied { return; }
-    let mut st = ctx.storage.lock().unwrap();
-    let mut buffer = ctx.block_buffer.lock().unwrap();
-    let our_before = val.last_block_height();
-    let mut applied = 0u64;
+    let mut applied_total = 0u64;
     let mut need_fork = false;
 
     loop {
-        let next = val.last_block_height() + 1;
-        if let Some(block_bytes) = buffer.remove(&next) {
-            let block: Block = match bincode::deserialize(&block_bytes) { Ok(b) => b, Err(_) => continue };
-            if block.height > 0 && st.load_genesis_block(block.height).ok().flatten().is_some() && val.last_block_height() >= block.height { continue; }
-            let original_hash = block.block_hash;
-            match val.validate_and_apply(&mut block.clone()) {
-                Ok(_) => { st.save_genesis_block(&block).ok(); st.save_utxo_set(val.utxo_set()).ok(); val.last_block_hash = original_hash; applied += 1; }
-                Err(e) => { if format!("{:?}", e).contains("prev_hash") && val.last_block_height() > 0 { need_fork = true; } break; }
+        let block_bytes = {
+            let val = ctx.validator.lock().unwrap();
+            let next = val.last_block_height() + 1;
+            drop(val);
+            let mut buffer = ctx.block_buffer.lock().unwrap();
+            buffer.remove(&next)
+        };
+
+        let block_bytes = match block_bytes { Some(b) => b, None => break };
+        let block: Block = match bincode::deserialize(&block_bytes) { Ok(b) => b, Err(_) => continue };
+
+        let mut val = ctx.validator.lock().unwrap();
+        let mut st = ctx.storage.lock().unwrap();
+
+        if block.height > 0 && st.load_genesis_block(block.height).ok().flatten().is_some() && val.last_block_height() >= block.height {
+            continue;
+        }
+
+        let original_hash = block.block_hash;
+        match val.validate_and_apply(&mut block.clone()) {
+            Ok(_) => {
+                st.save_genesis_block(&block).ok();
+                st.save_utxo_set(val.utxo_set()).ok();
+                val.last_block_hash = original_hash;
+                applied_total += 1;
             }
-        } else { break; }
+            Err(e) => {
+                if format!("{:?}", e).contains("prev_hash") && val.last_block_height() > 0 { need_fork = true; }
+                break;
+            }
+        }
     }
-    if applied > 0 { tracing::info!("[SYNC] flush: applied {} blocks, height {} -> {}", applied, our_before, val.last_block_height()); }
-    drop(buffer); drop(st); drop(val);
+
+    if applied_total > 0 {
+        tracing::info!("[SYNC] flush: applied {} blocks", applied_total);
+    }
 
     if need_fork {
         if let Ok(mut orch) = ctx.orchestrator.lock() {
-            let mut v = ctx.validator.lock().unwrap(); let mut s = ctx.storage.lock().unwrap();
+            let mut v = ctx.validator.lock().unwrap();
+            let mut s = ctx.storage.lock().unwrap();
             match orch.resolve_fork(&mut v, &mut s) {
                 Ok(saved) => tracing::info!("[SYNC] Fork resolved: {} blocks saved", saved),
                 Err(e) => tracing::error!("[SYNC] Fork resolution failed: {}", e),

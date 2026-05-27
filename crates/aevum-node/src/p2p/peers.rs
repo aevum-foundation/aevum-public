@@ -17,7 +17,11 @@ const BAN_DURATION_FIRST: Duration = Duration::from_secs(60);
 const BAN_DURATION_SECOND: Duration = Duration::from_secs(300);
 
 pub(crate) struct PeerState {
-    tx: mpsc::Sender<Vec<u8>>, addr: SocketAddr, msg_count: u64, last_reset: Instant,
+    pub tx: mpsc::Sender<Vec<u8>>,
+    pub addr: SocketAddr,
+    pub msg_count: u64,
+    pub last_reset: Instant,
+    pub peer_height: u64,
 }
 
 pub struct PeersManager {
@@ -85,7 +89,7 @@ impl PeersManager {
 
     pub fn register_peer(&self, peer_id: [u8; 20], addr: SocketAddr, tx: mpsc::Sender<Vec<u8>>) {
         tracing::info!("[PEERS] register_peer: {} ({})", hex::encode(&peer_id), addr);
-        self.peers.insert(peer_id, PeerState { tx, addr, msg_count: 0, last_reset: Instant::now() });
+        self.peers.insert(peer_id, PeerState { tx, addr, msg_count: 0, last_reset: Instant::now(), peer_height: 0 });
         self.peer_ips.insert(peer_id, addr);
         *self.ip_connections.entry(addr).or_insert(0) += 1;
         tracing::info!("[PEERS] total peers after register: {}", self.peers.len());
@@ -129,6 +133,16 @@ impl PeersManager {
     pub fn broadcast(&self, msg: Vec<u8>) {
         for e in &self.peers { let _ = e.value().tx.try_send(msg.clone()); }
     }
+
+    pub fn update_peer_height(&self, peer_id: &[u8; 20], height: u64) {
+        if let Some(mut peer) = self.peers.get_mut(peer_id) {
+            if height > peer.peer_height { peer.peer_height = height; }
+        }
+    }
+
+    pub fn get_peer_height(&self, peer_id: &[u8; 20]) -> u64 {
+        self.peers.get(peer_id).map(|p| p.peer_height).unwrap_or(0)
+    }
 }
 
 pub async fn accept_connection(
@@ -140,18 +154,14 @@ pub async fn accept_connection(
     let mut init_msg = [0u8; 64];
     tokio::time::timeout(HANDSHAKE_TIMEOUT, reader.read_exact(&mut init_msg))
         .await.map_err(|_| "timeout".to_string())?.map_err(|e| format!("read: {}", e))?;
-    {
-        let mut pk_bytes = [0u8; 32]; pk_bytes.copy_from_slice(&init_msg[..32]);
-        let pk = aevum::crypto::keys::PublicKey::from_bytes(pk_bytes).map_err(|_| "bad pk")?;
-        if !tofu.lock().unwrap().check_or_store(&addr, &pk) { return Err("TOFU".into()); }
-    }
-    let resp = handshake.step2_responder(&init_msg);
+    let mut pk_bytes = [0u8; 32]; pk_bytes.copy_from_slice(&init_msg[..32]);
+    let pk = aevum::crypto::keys::PublicKey::from_bytes(pk_bytes).map_err(|_| "bad pk")?;
+    if !tofu.lock().unwrap().check_or_store(&addr, &pk) { return Err("TOFU".into()); }
+    let resp = handshake.step2_responder(&init_msg).map_err(|e| format!("handshake: {}", e))?;
     tokio::time::timeout(HANDSHAKE_TIMEOUT, writer.write_all(&resp))
         .await.map_err(|_| "timeout".to_string())?.map_err(|e| format!("write: {}", e))?;
     let secret = *handshake.shared_secret().ok_or("handshake")?;
-    let cipher = AtpCipher::new(&secret);
-    let mut pk_bytes = [0u8; 32]; pk_bytes.copy_from_slice(&init_msg[..32]);
-    let pk = aevum::crypto::keys::PublicKey::from_bytes(pk_bytes).unwrap();
+    let cipher = AtpCipher::with_peer_pubkey(&secret, pk.clone());
     let peer_id = peer_id_from_pubkey(&pk);
     Ok((cipher, peer_id, addr, reader, writer))
 }
@@ -165,14 +175,13 @@ pub async fn dial_peer(
     let init_msg = handshake.step1_initiator();
     tokio::time::timeout(HANDSHAKE_TIMEOUT, writer.write_all(&init_msg))
         .await.map_err(|_| "timeout".to_string())?.map_err(|e| format!("write: {}", e))?;
-    let mut resp = [0u8; 64];
+    let mut resp = [0u8; 96];
     tokio::time::timeout(HANDSHAKE_TIMEOUT, reader.read_exact(&mut resp))
         .await.map_err(|_| "timeout".to_string())?.map_err(|e| format!("read: {}", e))?;
-    handshake.step3_initiator(&resp);
+    handshake.step3_initiator(&resp).map_err(|e| format!("handshake: {}", e))?;
     let secret = *handshake.shared_secret().ok_or("handshake")?;
-    let cipher = AtpCipher::new(&secret);
-    let mut pk_bytes = [0u8; 32]; pk_bytes.copy_from_slice(&resp[..32]);
-    let pk = aevum::crypto::keys::PublicKey::from_bytes(pk_bytes).unwrap();
+    let pk = handshake.peer_pubkey().ok_or("no peer pubkey")?.clone();
+    let cipher = AtpCipher::with_peer_pubkey(&secret, pk.clone());
     let peer_id = peer_id_from_pubkey(&pk);
     Ok((cipher, peer_id, reader, writer))
 }
