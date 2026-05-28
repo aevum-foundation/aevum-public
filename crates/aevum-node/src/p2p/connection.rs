@@ -87,6 +87,7 @@ pub struct AtpConnection {
     outgoing_tx: Option<mpsc::Sender<Vec<u8>>>,
     peer_height: u64,
     last_snapshot_sent: Instant,
+    snapshot_count: u64,
 }
 
 impl AtpConnection {
@@ -116,6 +117,7 @@ impl AtpConnection {
             send_cipher, recv_cipher, shared_secret,
             outgoing_tx: None, peer_height: 0,
             last_snapshot_sent: Instant::now(),
+            snapshot_count: 0,
         }
     }
 
@@ -138,29 +140,24 @@ impl AtpConnection {
         let health = Arc::new(TokioMutex::new(ConnectionHealth::default()));
 
         // ── HANDSHAKE ──────────────────────────────────
-        tracing::info!("[CONN] HANDSHAKE START: is_server={}", self.is_server);
         if self.is_server {
             if let Ok(encrypted) = Self::read_handshake_msg(&mut reader).await {
                 if let Some(p) = recv_cipher.lock().await.decrypt(&encrypted) {
                     if let Ok(AtpMessage::Status { height, .. }) = bincode::deserialize::<AtpMessage>(&p) {
                         self.peer_height = height;
-                        tracing::info!("[CONN] HANDSHAKE server: received Status height={}", height);
                     }
                 }
-            } else { tracing::warn!("[CONN] HANDSHAKE server: read failed"); return; }
+            } else { return; }
             Self::send_msg(&send_cipher, &create_status(&ctx), &mut writer).await;
-            tracing::info!("[CONN] HANDSHAKE server: Status sent");
         } else {
             Self::send_msg(&send_cipher, &create_status(&ctx), &mut writer).await;
-            tracing::info!("[CONN] HANDSHAKE client: Status sent, waiting for response");
             if let Ok(encrypted) = Self::read_handshake_msg(&mut reader).await {
                 if let Some(p) = recv_cipher.lock().await.decrypt(&encrypted) {
                     if let Ok(AtpMessage::Status { height, .. }) = bincode::deserialize::<AtpMessage>(&p) {
                         self.peer_height = height;
-                        tracing::info!("[CONN] HANDSHAKE client: received Status height={}", height);
                     }
                 }
-            } else { tracing::warn!("[CONN] HANDSHAKE client: read failed"); return; }
+            } else { return; }
         }
 
         let our_h = { ctx.validator.lock().unwrap().last_block_height() };
@@ -176,19 +173,17 @@ impl AtpConnection {
         { ctx.dht.lock().unwrap().add_or_update(node_id, self.addr, now); }
 
         if our_h > 0 && self.peer_height > 0 && self.peer_height < our_h && health.lock().await.can_request_solo() {
-            tracing::info!("[CONN] Requesting solo blocks from peer {} (peer_h={}, our_h={})", hex::encode(&peer_id), self.peer_height, our_h);
+            tracing::info!("[CONN] Requesting solo blocks from peer {}", hex::encode(&peer_id));
             let req = AtpMessage::SoloChainRequest;
             if let Ok(data) = bincode::serialize(&req) { let _ = self.outgoing_tx.as_ref().map(|tx| tx.try_send(data)); }
         }
 
-        // Пробрасываем Status в sync.rs для запуска синхронизации
         let peer_status = AtpMessage::Status { height: self.peer_height, poh_tick: 0, state_root: [0u8; 32], total_supply: 0, version: 1, capabilities: 0x01 };
         handle_atp_message(peer_status, &ctx, &peer_id, &peers);
 
         self.state = ConnState::Active;
         let writer = Arc::new(TokioMutex::new(writer));
 
-        // ── Keepalive: отправляем Ping, ждём 30с, проверяем Pong ──
         let kp_tx = self.outgoing_tx.clone().unwrap();
         let kp_health = health.clone();
         let keepalive_handle = tokio::spawn(async move {
@@ -205,7 +200,6 @@ impl AtpConnection {
 
         let snap_recv_cipher = Arc::new(TokioMutex::new(AtpCipher::new(&shared_secret)));
 
-        // ── Главный цикл ──────────────────────────────
         tracing::info!("[CONN] Main loop START");
         loop {
             tokio::select! {
@@ -267,15 +261,13 @@ impl AtpConnection {
             AtpMessage::SnapshotRequest => self.handle_snapshot_request(ctx, writer, shared_secret).await,
             AtpMessage::SnapshotResponse { .. } => { handle_atp_message(msg, ctx, peer_id, peers); }
             AtpMessage::SoloChain { blocks } => {
-                if blocks.len() > MAX_SOLO_CHAIN_BLOCKS { tracing::warn!("[CONN] SoloChain too large: {}", blocks.len()); }
+                if blocks.len() > MAX_SOLO_CHAIN_BLOCKS { tracing::warn!("[CONN] SoloChain too large"); }
                 else { handle_atp_message(msg, ctx, peer_id, peers); }
             }
             AtpMessage::SoloChainRequest => { handle_atp_message(msg, ctx, peer_id, peers); }
             AtpMessage::Status { height, .. } => {
-                tracing::info!("[CONN] Status received: height={}", height);
                 self.peer_height = *height;
                 peers.update_peer_height(peer_id, *height);
-                // ВСЕГДА передаём Status в sync.rs — он сам решит что делать (снапшот, заголовки, блоки)
                 handle_atp_message(msg, ctx, peer_id, peers);
             }
             AtpMessage::Pong { .. } => { health.lock().await.last_pong = Instant::now(); }
@@ -290,11 +282,13 @@ impl AtpConnection {
     }
 
     async fn handle_snapshot_request(&mut self, ctx: &Arc<SyncContext>, writer: &Arc<TokioMutex<WriteHalf<TcpStream>>>, shared_secret: &[u8; 32]) {
-        if self.last_snapshot_sent.elapsed().as_secs() < SNAPSHOT_RATE_LIMIT_SECS {
-            tracing::warn!("[CONN] SnapshotRequest rate limited from {}", hex::encode(&self.peer_id));
+        self.snapshot_count += 1;
+        // Первый запрос всегда разрешён. Повторные — не чаще 1 раза в SNAPSHOT_RATE_LIMIT_SECS
+        if self.snapshot_count > 1 && self.last_snapshot_sent.elapsed().as_secs() < SNAPSHOT_RATE_LIMIT_SECS {
+            tracing::warn!("[CONN] SnapshotRequest rate limited from {} (count={})", hex::encode(&self.peer_id), self.snapshot_count);
             return;
         }
-        tracing::info!("[CONN] SnapshotRequest received");
+        tracing::info!("[CONN] SnapshotRequest received (count={})", self.snapshot_count);
         self.last_snapshot_sent = Instant::now();
 
         let (height, utxo_data, block_hash, state_root) = {
@@ -311,9 +305,6 @@ impl AtpConnection {
 
     fn handle_header_request(&self, ctx: &Arc<SyncContext>, from: u64, to: u64) {
         let actual_to = to.min(from + MAX_HEADERS_PER_REQUEST);
-        if to - from > MAX_HEADERS_PER_REQUEST {
-            tracing::warn!("[CONN] HeaderRequest clamped: {}-{} -> {}-{}", from, to, from, actual_to);
-        }
         let resp = {
             let st = ctx.storage.lock().unwrap();
             let mut headers = Vec::new();
