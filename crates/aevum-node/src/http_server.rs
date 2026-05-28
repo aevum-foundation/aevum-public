@@ -6,27 +6,193 @@ use crate::storage::Storage;
 use crate::p2p::peers::PeersManager;
 use crate::p2p::sync::AtpMessage;
 use crate::config::NodeConfig;
-use std::collections::BTreeMap;
-use std::io::Read;
+use axum::{
+    extract::{Query, State},
+    http::{Method, StatusCode},
+    response::{IntoResponse, Json},
+    routing::{get, post},
+    Router,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tiny_http::{Response, Method, Header, StatusCode};
 
 const MAX_HISTORY_LIMIT: usize = 100;
+const MAX_HISTORY_SCAN_BLOCKS: u64 = 10_000;
 const MAX_UTXOS_LIMIT: usize = 500;
+const TX_RATE_LIMIT_PER_IP: u64 = 10;
+const TX_RATE_WINDOW: Duration = Duration::from_secs(60);
 
+#[derive(Clone)]
 pub struct BalanceCache {
     pub balances: BTreeMap<String, u64>,
-    pub last_update: Instant,
+    pub needs_rebuild: bool,
 }
 
-fn cors_response(body: &str, origin: &str) -> Response<std::io::Cursor<Vec<u8>>> {
-    let mut resp = Response::from_string(body);
-    resp.add_header(Header::from_bytes("Access-Control-Allow-Origin", origin).unwrap());
-    resp.add_header(Header::from_bytes("Access-Control-Allow-Methods", "GET, POST, OPTIONS").unwrap());
-    resp.add_header(Header::from_bytes("Access-Control-Allow-Headers", "Content-Type").unwrap());
-    resp
+impl BalanceCache {
+    pub fn new() -> Self { Self { balances: BTreeMap::new(), needs_rebuild: true } }
+    pub fn rebuild(&mut self, utxo_set: &aevum::core::state::UtxoSet) {
+        self.balances.clear();
+        for (_, utxo) in utxo_set.all() {
+            let addr = hex::encode(utxo.owner().to_bytes());
+            *self.balances.entry(addr).or_insert(0) += utxo.amount();
+        }
+        self.needs_rebuild = false;
+    }
+    pub fn add_reward(&mut self, miner_hex: &str, amount_satoshi: u64) {
+        *self.balances.entry(miner_hex.to_string()).or_insert(0) += amount_satoshi;
+    }
+    pub fn get(&self, addr: &str) -> u64 { self.balances.get(addr).copied().unwrap_or(0) }
+}
+
+pub type SharedBalanceCache = Arc<StdMutex<BalanceCache>>;
+pub fn new_shared_balance_cache() -> SharedBalanceCache { Arc::new(StdMutex::new(BalanceCache::new())) }
+
+#[derive(Clone)]
+struct AppState {
+    validator: Arc<StdMutex<Validator>>,
+    mempool: Arc<StdMutex<Mempool>>,
+    peers: Arc<PeersManager>,
+    storage: Arc<StdMutex<Storage>>,
+    network_height: Arc<StdMutex<u64>>,
+    balance_cache: SharedBalanceCache,
+    miner_pubkey: PublicKey,
+    genesis_addr: String,
+    start_time: Instant,
+    tx_rate_limiter: Arc<StdMutex<HashMap<SocketAddr, (Instant, u64)>>>,
+}
+
+#[derive(Deserialize)]
+struct UtxoQuery { address: Option<String> }
+
+#[derive(Deserialize)]
+struct HistoryQuery { address: Option<String>, limit: Option<usize> }
+
+#[derive(Serialize)]
+struct HealthResponse { status: String, height: u64, peers: usize, synced: bool, uptime_sec: u64 }
+
+#[derive(Serialize)]
+struct StatusResponse { height: u64, peers: usize, mempool: usize, utxos: usize, poh_tick: u64, supply: u64, uptime_sec: u64, network_height: u64, synced: bool }
+
+#[derive(Serialize)]
+struct BalanceResponse { miner: String, miner_aev: f64, founder_aev: f64, total_aev: f64 }
+
+async fn health_handler(State(state): State<AppState>) -> Json<HealthResponse> {
+    let val = state.validator.lock().unwrap();
+    let nh = *state.network_height.lock().unwrap();
+    Json(HealthResponse {
+        status: "ok".into(), height: val.last_block_height(),
+        peers: state.peers.peer_count(), synced: val.last_block_height() >= nh,
+        uptime_sec: state.start_time.elapsed().as_secs(),
+    })
+}
+
+async fn status_handler(State(state): State<AppState>) -> Json<StatusResponse> {
+    let val = state.validator.lock().unwrap();
+    let nh = *state.network_height.lock().unwrap();
+    Json(StatusResponse {
+        height: val.last_block_height(), peers: state.peers.peer_count(),
+        mempool: state.mempool.lock().unwrap().len(), utxos: val.utxo_set().len(),
+        poh_tick: val.poh().current_tick_number(), supply: val.utxo_set().total_supply(),
+        uptime_sec: state.start_time.elapsed().as_secs(), network_height: nh,
+        synced: val.last_block_height() >= nh,
+    })
+}
+
+async fn balance_handler(State(state): State<AppState>) -> Json<BalanceResponse> {
+    let miner_addr = hex::encode(state.miner_pubkey.to_bytes());
+    let mut cache = state.balance_cache.lock().unwrap();
+    if cache.needs_rebuild {
+        let val = state.validator.lock().unwrap();
+        cache.rebuild(&val.utxo_set());
+    }
+    let miner_balance = cache.get(&miner_addr) as f64 / 100_000_000.0;
+    let founder_balance = cache.get(&state.genesis_addr) as f64 / 100_000_000.0;
+    let total_supply = state.validator.lock().unwrap().utxo_set().total_supply() as f64 / 100_000_000.0;
+    Json(BalanceResponse {
+        miner: miner_addr[..16].into(), miner_aev: miner_balance,
+        founder_aev: founder_balance, total_aev: total_supply,
+    })
+}
+
+async fn utxos_handler(State(state): State<AppState>, Query(q): Query<UtxoQuery>) -> String {
+    let val = state.validator.lock().unwrap();
+    let utxo_set = val.utxo_set();
+    let mut result = String::from("[");
+    let mut count = 0usize;
+    for (_, u) in utxo_set.all() {
+        if count >= MAX_UTXOS_LIMIT { break; }
+        if q.address.as_ref().map_or(true, |a| hex::encode(u.owner().to_bytes()).starts_with(a)) {
+            if count > 0 { result.push(','); }
+            result.push_str(&format!("{{\"amount\":{},\"height\":{},\"tx_hash\":\"{}\"}}",
+                u.amount(), u.created_height(), hex::encode(u.tx_hash().as_bytes())));
+            count += 1;
+        }
+    }
+    result.push(']');
+    result
+}
+
+async fn history_handler(State(state): State<AppState>, Query(q): Query<HistoryQuery>) -> String {
+    let limit = q.limit.unwrap_or(10).min(MAX_HISTORY_LIMIT);
+    let mut st = state.storage.lock().unwrap();
+    let h = st.max_genesis_height().unwrap_or(None).unwrap_or(0);
+    let scan_start = h.saturating_sub(MAX_HISTORY_SCAN_BLOCKS);
+    let mut result = String::from("[");
+    let mut found = 0usize;
+    for bh in (scan_start..=h).rev() {
+        if found >= limit { break; }
+        if bh % 1000 == 0 && bh != h { drop(st); std::thread::sleep(Duration::from_millis(1)); st = state.storage.lock().unwrap(); }
+        if let Ok(Some(block)) = st.load_genesis_block(bh) {
+            for tx in &block.transactions {
+                if found >= limit { break; }
+                let involved = q.address.as_ref().map_or(true, |a| {
+                    tx.inputs.iter().any(|i| hex::encode(i.public_key.to_bytes()).starts_with(a))
+                    || tx.outputs.iter().any(|o| hex::encode(o.owner.to_bytes()).starts_with(a))
+                });
+                if involved {
+                    if found > 0 { result.push(','); }
+                    result.push_str(&format!("{{\"height\":{},\"tx_hash\":\"{}\",\"fee\":{}}}",
+                        bh, tx.tx_hash.to_hex(), tx.fee));
+                    found += 1;
+                }
+            }
+        }
+    }
+    result.push(']');
+    result
+}
+
+async fn tx_handler(State(state): State<AppState>, headers: axum::http::HeaderMap, body: String) -> impl IntoResponse {
+    let peer_addr = headers.get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<SocketAddr>().ok())
+        .unwrap_or_else(|| "127.0.0.1:0".parse().unwrap());
+
+    let mut limiter = state.tx_rate_limiter.lock().unwrap();
+    let entry = limiter.entry(peer_addr).or_insert((Instant::now(), 0));
+    let now = Instant::now();
+    if now.duration_since(entry.0) > TX_RATE_WINDOW { *entry = (now, 1); }
+    else if entry.1 >= TX_RATE_LIMIT_PER_IP { return (StatusCode::TOO_MANY_REQUESTS, "Too many transactions").into_response(); }
+    else { entry.1 += 1; }
+    drop(limiter);
+
+    match serde_json::from_str::<Transaction>(&body) {
+        Ok(tx) => {
+            if tx.inputs.is_empty() && tx.outputs.len() == 1 { return (StatusCode::BAD_REQUEST, "Coinbase not accepted").into_response(); }
+            else if tx.inputs.is_empty() { return (StatusCode::BAD_REQUEST, "No inputs").into_response(); }
+            else if tx.outputs.is_empty() { return (StatusCode::BAD_REQUEST, "No outputs").into_response(); }
+            state.mempool.lock().unwrap().insert(tx.clone()).ok();
+            if let Ok(data) = bincode::serialize(&AtpMessage::Transaction { tx_hash: [0u8; 32], ttl: 0, bytes: bincode::serialize(&tx).unwrap_or_default() }) {
+                state.peers.broadcast(data);
+            }
+            (StatusCode::OK, "{\"status\":\"ok\"}").into_response()
+        }
+        Err(_) => (StatusCode::BAD_REQUEST, "Invalid JSON").into_response(),
+    }
 }
 
 pub fn start(
@@ -36,130 +202,37 @@ pub fn start(
     peers: Arc<PeersManager>,
     storage: Arc<StdMutex<Storage>>,
     network_height: Arc<StdMutex<u64>>,
-    balance_cache: Arc<StdMutex<BalanceCache>>,
+    balance_cache: SharedBalanceCache,
     miner_pubkey: PublicKey,
     shutdown: Arc<AtomicBool>,
 ) {
-    let cors_origin = config.cors_header_value();
-    let genesis_addr = config.genesis_address.clone();
+    let state = AppState {
+        validator, mempool, peers, storage, network_height, balance_cache, miner_pubkey,
+        genesis_addr: config.genesis_address.clone(),
+        start_time: Instant::now(),
+        tx_rate_limiter: Arc::new(StdMutex::new(HashMap::new())),
+    };
+
+    let app = Router::new()
+        .route("/health", get(health_handler))
+        .route("/status", get(status_handler))
+        .route("/balance", get(balance_handler))
+        .route("/utxos", get(utxos_handler))
+        .route("/history", get(history_handler))
+        .route("/tx", post(tx_handler))
+        .with_state(state);
+
+    let addr: SocketAddr = format!("0.0.0.0:{}", config.http_port).parse().unwrap();
+    let listener = std::net::TcpListener::bind(addr).unwrap();
+    listener.set_nonblocking(true).ok();
 
     std::thread::spawn(move || {
-        let server = match tiny_http::Server::http(&format!("0.0.0.0:{}", config.http_port)) {
-            Ok(s) => s,
-            Err(e) => { tracing::error!("HTTP server failed: {}", e); return; }
-        };
-        let start_time = Instant::now();
-
-        while !shutdown.load(Ordering::SeqCst) {
-            match server.recv_timeout(Duration::from_secs(1)) {
-                Ok(Some(mut req)) => {
-                    let url = req.url().to_string();
-                    let method = req.method();
-
-                    match url.as_str() {
-                        u if u == "/health" => {
-                            let val = validator.lock().unwrap();
-                            let nh = *network_height.lock().unwrap();
-                            let synced = val.last_block_height() >= nh;
-                            let s = format!("{{\"status\":\"ok\",\"height\":{},\"peers\":{},\"synced\":{},\"uptime_sec\":{}}}",
-                                val.last_block_height(), peers.peer_count(), synced, start_time.elapsed().as_secs());
-                            req.respond(cors_response(&s, &cors_origin)).ok();
-                        }
-                        u if u.starts_with("/status") => {
-                            let val = validator.lock().unwrap();
-                            let nh = *network_height.lock().unwrap();
-                            let synced = val.last_block_height() >= nh;
-                            let s = format!("{{\"height\":{},\"peers\":{},\"mempool\":{},\"utxos\":{},\"poh_tick\":{},\"supply\":{},\"uptime_sec\":{},\"network_height\":{},\"synced\":{}}}",
-                                val.last_block_height(), peers.peer_count(), mempool.lock().unwrap().len(),
-                                val.utxo_set().len(), val.poh().current_tick_number(), val.utxo_set().total_supply(),
-                                start_time.elapsed().as_secs(), nh, synced);
-                            req.respond(cors_response(&s, &cors_origin)).ok();
-                        }
-                        u if u.starts_with("/balance") => {
-                            let val = validator.lock().unwrap();
-                            let utxo_set = val.utxo_set();
-                            let mut cache = balance_cache.lock().unwrap();
-                            if cache.last_update.elapsed() > Duration::from_secs(30) {
-                                cache.balances.clear();
-                                for (_, utxo) in utxo_set.all() {
-                                    let addr = hex::encode(utxo.owner().to_bytes());
-                                    *cache.balances.entry(addr).or_insert(0) += utxo.amount();
-                                }
-                                cache.last_update = Instant::now();
-                            }
-                            let miner_addr = hex::encode(miner_pubkey.to_bytes());
-                            let miner_balance = cache.balances.get(&miner_addr).copied().unwrap_or(0) as f64 / 100_000_000.0;
-                            let founder_balance = cache.balances.get(&genesis_addr).copied().unwrap_or(0) as f64 / 100_000_000.0;
-                            let total = utxo_set.total_supply() as f64 / 100_000_000.0;
-                            let s = format!("{{\"miner\":\"{}\",\"miner_aev\":{:.8},\"founder_aev\":{:.8},\"total_aev\":{:.8}}}",
-                                &miner_addr[..16], miner_balance, founder_balance, total);
-                            req.respond(cors_response(&s, &cors_origin)).ok();
-                        }
-                        u if u.starts_with("/utxos") => {
-                            let val = validator.lock().unwrap();
-                            let utxo_set = val.utxo_set();
-                            let addr_param = url.split("address=").nth(1).unwrap_or("");
-                            let mut result = String::from("[");
-                            let mut count = 0usize;
-                            for (_, u) in utxo_set.all() {
-                                if count >= MAX_UTXOS_LIMIT { break; }
-                                if addr_param.is_empty() || hex::encode(u.owner().to_bytes()).starts_with(addr_param) {
-                                    result.push_str(&format!("{{\"amount\":{},\"height\":{},\"tx_hash\":\"{}\"}},",
-                                        u.amount(), u.created_height(), hex::encode(u.tx_hash().as_bytes())));
-                                    count += 1;
-                                }
-                            }
-                            if result.ends_with(',') { result.pop(); }
-                            result.push(']');
-                            req.respond(cors_response(&result, &cors_origin)).ok();
-                        }
-                        u if u.starts_with("/history") => {
-                            let addr_param = url.split("address=").nth(1).unwrap_or("");
-                            let mut limit = url.split("limit=").nth(1).and_then(|s| s.split("&").next()).and_then(|s| s.parse::<usize>().ok()).unwrap_or(10);
-                            if limit > MAX_HISTORY_LIMIT { limit = MAX_HISTORY_LIMIT; }
-                            let st = storage.lock().unwrap();
-                            let h = st.max_genesis_height().unwrap_or(None).unwrap_or(0);
-                            let mut result = String::from("[");
-                            let mut found = 0usize;
-                            for bh in (0..=h).rev() {
-                                if found >= limit { break; }
-                                if let Ok(Some(block)) = st.load_genesis_block(bh) {
-                                    for tx in &block.transactions {
-                                        let mut involved = addr_param.is_empty();
-                                        if !involved {
-                                            for i in &tx.inputs { if hex::encode(i.public_key.to_bytes()).starts_with(&addr_param) { involved = true; break; } }
-                                            if !involved { for o in &tx.outputs { if hex::encode(o.owner.to_bytes()).starts_with(&addr_param) { involved = true; break; } } }
-                                        }
-                                        if involved {
-                                            result.push_str(&format!("{{\"height\":{},\"tx_hash\":\"{}\",\"fee\":{}}},", bh, tx.tx_hash.to_hex(), tx.fee));
-                                            found += 1;
-                                        }
-                                    }
-                                }
-                            }
-                            if result.ends_with(',') { result.pop(); }
-                            result.push(']');
-                            req.respond(cors_response(&result, &cors_origin)).ok();
-                        }
-                        u if u.starts_with("/tx") && method == &Method::Post => {
-                            let mut body = String::new(); req.as_reader().read_to_string(&mut body).ok();
-                            if let Ok(tx) = serde_json::from_str::<Transaction>(&body) {
-                                mempool.lock().unwrap().insert(tx.clone()).ok();
-                                if let Ok(data) = bincode::serialize(&AtpMessage::Transaction { tx_hash: [0u8; 32], ttl: 0, bytes: bincode::serialize(&tx).unwrap_or_default() }) {
-                                    peers.broadcast(data);
-                                }
-                                req.respond(cors_response("{\"status\":\"ok\"}", &cors_origin)).ok();
-                            } else { req.respond(cors_response("{\"status\":\"err\"}", &cors_origin)).ok(); }
-                        }
-                        _ => {
-                            req.respond(Response::from_string("404").with_status_code(StatusCode(404))).ok();
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(_) => break,
-            }
-        }
-        tracing::info!("HTTP server stopped");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            axum::serve(listener, app).with_graceful_shutdown(async move {
+                while !shutdown.load(Ordering::SeqCst) { tokio::time::sleep(Duration::from_secs(1)).await; }
+            }).await.unwrap();
+        });
     });
 }
