@@ -12,16 +12,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use std::net::SocketAddr;
 
-// ── Константы ────────────────────────────────────────────────
 const MAX_SOLO_CHAIN_BLOCKS: usize = 1000;
 const MAX_HEADERS_PER_REQUEST: u64 = 2000;
 const HANDSHAKE_MAX_SIZE: usize = 1024;
-const SNAPSHOT_RATE_LIMIT_SECS: u64 = 5;
+const SNAPSHOT_RATE_LIMIT_SECS: u64 = 60;
 const PONG_TIMEOUT_SECS: u64 = 90;
 const MAX_INBOUND_MSG_RATE: u64 = 100;
 const MIN_SOLO_REQUEST_INTERVAL: Duration = Duration::from_secs(60);
 
-// ── Метрики ──────────────────────────────────────────────────
 static METRIC_TOTAL_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 static METRIC_RATE_LIMITED_DROPS: AtomicU64 = AtomicU64::new(0);
 static METRIC_PONG_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
@@ -34,7 +32,6 @@ pub fn connection_metrics() -> (u64, u64, u64, u64) {
      METRIC_PEER_ID_MISMATCHES.load(Ordering::Relaxed))
 }
 
-// ── Структуры ────────────────────────────────────────────────
 #[derive(Debug, Clone)]
 pub struct ConnectionHealth {
     pub connected_at: Instant,
@@ -118,7 +115,7 @@ impl AtpConnection {
             state: ConnState::Handshaking,
             send_cipher, recv_cipher, shared_secret,
             outgoing_tx: None, peer_height: 0,
-            last_snapshot_sent: Instant::now() - Duration::from_secs(60),
+            last_snapshot_sent: Instant::now(),
         }
     }
 
@@ -184,28 +181,28 @@ impl AtpConnection {
             if let Ok(data) = bincode::serialize(&req) { let _ = self.outgoing_tx.as_ref().map(|tx| tx.try_send(data)); }
         }
 
+        // Пробрасываем Status в sync.rs для запуска синхронизации
         let peer_status = AtpMessage::Status { height: self.peer_height, poh_tick: 0, state_root: [0u8; 32], total_supply: 0, version: 1, capabilities: 0x01 };
         handle_atp_message(peer_status, &ctx, &peer_id, &peers);
 
         self.state = ConnState::Active;
         let writer = Arc::new(TokioMutex::new(writer));
 
-        // ── Keepalive ──────────────────────────────────
+        // ── Keepalive: отправляем Ping, ждём 30с, проверяем Pong ──
         let kp_tx = self.outgoing_tx.clone().unwrap();
         let kp_health = health.clone();
         let keepalive_handle = tokio::spawn(async move {
             loop {
+                let ping = AtpMessage::Ping { nonce: rand::random() };
+                if let Ok(data) = bincode::serialize(&ping) { if kp_tx.try_send(data).is_err() { break; } }
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 if !kp_health.lock().await.check_pong_timeout() {
                     tracing::warn!("[CONN] Pong timeout — closing connection");
                     break;
                 }
-                let ping = AtpMessage::Ping { nonce: rand::random() };
-                if let Ok(data) = bincode::serialize(&ping) { if kp_tx.try_send(data).is_err() { break; } }
             }
         });
 
-        // SnapshotCipher для приёма SnapshotResponse (свежий, только для recv)
         let snap_recv_cipher = Arc::new(TokioMutex::new(AtpCipher::new(&shared_secret)));
 
         // ── Главный цикл ──────────────────────────────
@@ -268,7 +265,7 @@ impl AtpConnection {
     ) {
         match &msg {
             AtpMessage::SnapshotRequest => self.handle_snapshot_request(ctx, writer, shared_secret).await,
-            AtpMessage::SnapshotResponse { height, .. } => { tracing::info!("[CONN] SnapshotResponse received h={}", height); handle_atp_message(msg, ctx, peer_id, peers); }
+            AtpMessage::SnapshotResponse { .. } => { handle_atp_message(msg, ctx, peer_id, peers); }
             AtpMessage::SoloChain { blocks } => {
                 if blocks.len() > MAX_SOLO_CHAIN_BLOCKS { tracing::warn!("[CONN] SoloChain too large: {}", blocks.len()); }
                 else { handle_atp_message(msg, ctx, peer_id, peers); }
@@ -278,6 +275,7 @@ impl AtpConnection {
                 tracing::info!("[CONN] Status received: height={}", height);
                 self.peer_height = *height;
                 peers.update_peer_height(peer_id, *height);
+                // ВСЕГДА передаём Status в sync.rs — он сам решит что делать (снапшот, заголовки, блоки)
                 handle_atp_message(msg, ctx, peer_id, peers);
             }
             AtpMessage::Pong { .. } => { health.lock().await.last_pong = Instant::now(); }
@@ -305,7 +303,6 @@ impl AtpConnection {
             (val.last_block_height(), bincode::serialize(&utxo.clone()).unwrap_or_default(), val.last_block_hash().0, utxo.get_state_root().0)
         };
         let mut w = writer.lock().await;
-        // СВЕЖИЙ SnapshotCipher для каждого снапшота — гарантирует нулевые индексы
         let snap = SnapshotCipher::new(shared_secret);
         if let Err(e) = snap.send_snapshot_response(&mut *w, height, utxo_data, block_hash, state_root).await {
             tracing::warn!("[CONN] SnapshotResponse failed: {}", e);
