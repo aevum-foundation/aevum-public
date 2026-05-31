@@ -5,6 +5,8 @@ use aevum::crypto::keys::PublicKey;
 use sha2::{Sha256, Digest};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use chacha20poly1305::aead::{Aead, KeyInit as AeadKeyInit};
+use dashmap::DashMap;
+use std::net::SocketAddr;
 use std::path::Path;
 
 const ENCRYPTION_ROUNDS: u32 = 100_000;
@@ -171,6 +173,31 @@ impl Storage {
             }
         }
         Ok(blocks)
+    }
+
+    // ============================================================
+    // KNOWN ADDRESSES (персистентность пиров)
+    // ============================================================
+
+    pub fn save_known_addresses(&self, addrs: &DashMap<SocketAddr, u64>) -> Result<(), Box<dyn std::error::Error>> {
+        let list: Vec<(String, u64)> = addrs.iter().map(|e| (e.key().to_string(), *e.value())).collect();
+        let data = bincode::serialize(&list)?;
+        self.save_metadata("known_addresses", &data)
+    }
+
+    pub fn load_known_addresses(&self) -> Result<DashMap<SocketAddr, u64>, Box<dyn std::error::Error>> {
+        let data = match self.load_metadata("known_addresses")? {
+            Some(d) => d,
+            None => return Ok(DashMap::new()),
+        };
+        let list: Vec<(String, u64)> = bincode::deserialize(&data)?;
+        let map = DashMap::new();
+        for (addr_str, ts) in list {
+            if let Ok(addr) = addr_str.parse() {
+                map.insert(addr, ts);
+            }
+        }
+        Ok(map)
     }
 
     // ============================================================

@@ -26,8 +26,9 @@ impl AtpNode {
         _mempool: Arc<StdMutex<Mempool>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let our_key = aevum::crypto::keys::PrivateKey::generate();
+        let metrics: crate::http_server::SharedMetrics = Arc::new(crate::http_server::NodeMetrics::new());
 
-        let peers = Arc::new(PeersManager::new(our_key));
+        let peers = Arc::new(PeersManager::new(our_key, metrics.clone(), storage.clone()));
         let sync_ctx = Arc::new(SyncContext {
             validator,
             storage,
@@ -39,6 +40,7 @@ impl AtpNode {
             network_height: Arc::new(StdMutex::new(0)),
             sync_phase: Arc::new(parking_lot::Mutex::new(SyncPhase::Idle)),
             sync_peer: Arc::new(parking_lot::Mutex::new(None)),
+            metrics,
             pending_solo_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
         });
 
@@ -53,7 +55,6 @@ impl AtpNode {
             rt.block_on(async move {
                 let listener = TcpListener::bind(&listen_addr).await.unwrap();
                 tracing::info!("[ATP] Listening on {}", listen_addr);
-
                 if !bootstrap.is_empty() {
                     for addr_str in bootstrap.split(',') {
                         if let Ok(addr) = addr_str.trim().parse::<SocketAddr>() {

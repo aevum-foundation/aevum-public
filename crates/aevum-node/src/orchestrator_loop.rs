@@ -1,107 +1,69 @@
 use aevum::consensus::validator::Validator;
 use crate::storage::Storage;
 use crate::p2p::peers::PeersManager;
-use crate::p2p::sync::{AtpMessage, SyncPhase};
 use crate::p2p::chain_orchestrator::ChainOrchestrator;
+use crate::p2p::sync::SyncPhase;
+use crate::http_server::SharedMetrics;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const ORCHESTRATOR_INTERVAL: u64 = 30;
-const MAX_HEADERS_PER_REQUEST: u64 = 2000;
-const SNAPSHOT_THRESHOLD: u64 = 5000;
-const SOLO_REQUEST_COOLDOWN: Duration = Duration::from_secs(60);
-const PEER_CACHE_CLEANUP_INTERVAL: Duration = Duration::from_secs(300);
-const PEER_CACHE_MAX_AGE: Duration = Duration::from_secs(3600);
-
-static ORCHESTRATOR_SYNC_REQUESTS: AtomicU64 = AtomicU64::new(0);
-static ORCHESTRATOR_SOLO_REQUESTS: AtomicU64 = AtomicU64::new(0);
-
-pub fn orchestrator_metrics() -> (u64, u64) {
-    (ORCHESTRATOR_SYNC_REQUESTS.load(Ordering::Relaxed),
-     ORCHESTRATOR_SOLO_REQUESTS.load(Ordering::Relaxed))
-}
 
 pub fn start(
     validator: Arc<StdMutex<Validator>>,
-    _storage: Arc<StdMutex<Storage>>,
+    storage: Arc<StdMutex<Storage>>,
     network_height: Arc<StdMutex<u64>>,
     peers: Arc<PeersManager>,
-    _orchestrator: Arc<StdMutex<ChainOrchestrator>>,
+    orchestrator: Arc<StdMutex<ChainOrchestrator>>,
     sync_phase: Arc<parking_lot::Mutex<SyncPhase>>,
     shutdown: Arc<AtomicBool>,
+    metrics: SharedMetrics,
 ) {
     std::thread::spawn(move || {
-        let mut peer_solo_requests: HashMap<[u8; 20], Instant> = HashMap::new();
-        let mut last_cleanup = Instant::now();
-
         while !shutdown.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_secs(ORCHESTRATOR_INTERVAL));
 
             // Не мешаем активной синхронизации
             {
                 let phase = sync_phase.lock();
-                if *phase != SyncPhase::Idle && *phase != SyncPhase::Synced {
-                    tracing::debug!("[ORCH] Sync in progress ({:?}), skipping", *phase);
+                if phase.is_active() {
+                    tracing::debug!("[ORCH] Skipping: sync is active ({:?})", *phase);
                     continue;
                 }
             }
 
             let our_h = validator.lock().unwrap().last_block_height();
             let nh = *network_height.lock().unwrap();
-            let diff = nh.saturating_sub(our_h);
-            tracing::info!("[ORCH] tick: our={}, network={}, diff={}", our_h, nh, diff);
+            let peer_count = peers.peer_count();
 
-            // Синхронизация если отстаём
-            if diff > 50 {
-                ORCHESTRATOR_SYNC_REQUESTS.fetch_add(1, Ordering::Relaxed);
-                if our_h == 0 || diff > SNAPSHOT_THRESHOLD {
-                    tracing::info!("[ORCH] Large diff ({}): requesting snapshot", diff);
-                    let req = AtpMessage::SnapshotRequest;
-                    if let Ok(data) = bincode::serialize(&req) { peers.broadcast(data); }
-                } else if diff > MAX_HEADERS_PER_REQUEST {
-                    let chunk_end = our_h + MAX_HEADERS_PER_REQUEST;
-                    tracing::info!("[ORCH] Chunked sync: {}-{} (diff {})", our_h + 1, chunk_end, diff);
-                    let req = AtpMessage::HeaderRequest { from: our_h + 1, to: chunk_end };
-                    if let Ok(data) = bincode::serialize(&req) { peers.broadcast(data); }
-                } else {
-                    tracing::info!("[ORCH] Syncing: {}-{}", our_h + 1, nh);
-                    let req = AtpMessage::HeaderRequest { from: our_h + 1, to: nh };
-                    if let Ok(data) = bincode::serialize(&req) { peers.broadcast(data); }
-                }
-            } else if our_h > nh + 10 {
-                tracing::info!("[ORCH] We are ahead: us={}, network={}", our_h, nh);
-            }
+            tracing::info!("[ORCH] tick: our={}, network={}, diff={}, peers={}", our_h, nh, nh.saturating_sub(our_h), peer_count);
 
-            // Соло-блоки у отстающих пиров (с cooldown)
-            if our_h > 0 {
-                let now = Instant::now();
-                for peer_entry in &peers.peers {
-                    let peer_id = *peer_entry.key();
-                    let peer_h = peer_entry.value().peer_height;
-                    if peer_h > 0 && peer_h < our_h {
-                        if let Some(last) = peer_solo_requests.get(&peer_id) {
-                            if now.duration_since(*last) < SOLO_REQUEST_COOLDOWN { continue; }
+            // Вызываем process_chain для обработки новых блоков
+            if let Ok(mut orch) = orchestrator.lock() {
+                let mut val = validator.lock().unwrap();
+                let mut st = storage.lock().unwrap();
+                match orch.process_chain(&mut val, &mut st) {
+                    Ok(processed) => {
+                        if processed > 0 {
+                            tracing::info!("[ORCH] Processed {} blocks", processed);
                         }
-                        peer_solo_requests.insert(peer_id, now);
-                        ORCHESTRATOR_SOLO_REQUESTS.fetch_add(1, Ordering::Relaxed);
-                        tracing::info!("[ORCH] Requesting solo blocks from peer {}", hex::encode(&peer_id[..4]));
-                        let req = AtpMessage::SoloChainRequest;
-                        if let Ok(data) = bincode::serialize(&req) { peers.send_to(&peer_id, data); }
                     }
+                    Err(e) => tracing::warn!("[ORCH] process_chain error: {}", e),
                 }
+                drop(val); drop(st);
             }
 
-            // Очистка устаревших записей кеша пиров
-            if last_cleanup.elapsed() >= PEER_CACHE_CLEANUP_INTERVAL {
-                let before = peer_solo_requests.len();
-                peer_solo_requests.retain(|_, last| last.elapsed() < PEER_CACHE_MAX_AGE);
-                let removed = before - peer_solo_requests.len();
-                if removed > 0 {
-                    tracing::debug!("[ORCH] Cleaned {} stale peer entries", removed);
-                }
-                last_cleanup = Instant::now();
+            // Обновляем метрики
+            {
+                let val = validator.lock().unwrap();
+                let synced = val.last_block_height() >= nh;
+                metrics.update(
+                    val.last_block_height(), val.utxo_set().total_supply(), nh,
+                    peer_count, val.utxo_set().len(), 0, val.poh().current_tick_number(),
+                    synced,
+                );
             }
         }
     });

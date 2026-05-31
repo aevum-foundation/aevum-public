@@ -12,7 +12,7 @@ use crate::mining_loop::ConnectCommand;
 pub fn start(
     mut connect_rx: tokio_mpsc::UnboundedReceiver<ConnectCommand>,
     our_key: PrivateKey,
-    tofu: Arc<StdMutex<TofuStore>>,
+    tofu: Arc<tokio::sync::Mutex<TofuStore>>,
     peers: Arc<PeersManager>,
     sync_ctx: Arc<SyncContext>,
     _dht_integration: Arc<StdMutex<DhtIntegration>>,
@@ -27,7 +27,7 @@ pub fn start(
                     Ok((cipher, peer_id, reader, writer)) => {
                         tracing::info!("[DHT] Connected to peer {}", cmd.addr);
                         let conn = AtpConnection::new(cipher, peer_id, cmd.addr, cmd.peers.clone(), cmd.ctx.clone(), false);
-                        let _ = tokio::spawn(async move { conn.run(reader, writer).await; }).await;
+                        tokio::spawn(async move { conn.run(reader, writer).await; });
                     }
                     Err(e) => tracing::warn!("[DHT] Connect failed {}: {}", cmd.addr, e),
                 }

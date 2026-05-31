@@ -16,8 +16,9 @@ use aevum_node::p2p::dht::Dht;
 use aevum_node::p2p::dht_integration::DhtIntegration;
 use aevum_node::encrypted_replication::EncryptedReplication;
 use aevum_node::p2p::chain_orchestrator::ChainOrchestrator;
+use aevum_node::p2p::connection_manager::ConnectionManager;
 use aevum_node::config::NodeConfig;
-use aevum_node::http_server::BalanceCache;
+use aevum_node::http_server::{BalanceCache, SharedBalanceCache, SharedMetrics, NodeMetrics};
 use clap::Parser;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -39,7 +40,7 @@ fn create_genesis_block(config: &NodeConfig) -> Block {
 }
 
 #[derive(Parser)]
-#[command(name = "aevum-node", version = "0.7.0")]
+#[command(name = "aevum-node", version = "0.9.32")]
 struct Cli {
     #[arg(long, default_value = "0.0.0.0:9733")] listen_addr: String,
     #[arg(long, default_value = "")] bootstrap_peers: String,
@@ -61,19 +62,9 @@ fn load_miner_key(hex: &Option<String>) -> Result<Option<PrivateKey>, String> {
     }
 }
 
-struct ConnectCommand {
-    addr: std::net::SocketAddr,
-    our_key: PrivateKey,
-    tofu: Arc<StdMutex<TofuStore>>,
-    peers: Arc<PeersManager>,
-    ctx: Arc<SyncContext>,
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
-
-    // Сохраняем miner_key до перемещения cli в config
     let miner_key_hex = cli.miner_key.clone();
 
     let config = NodeConfig {
@@ -146,17 +137,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut dev_bytes = [0u8; 32]; dev_bytes.copy_from_slice(&dev_addr_bytes[..32]);
     let developer_address = aevum::crypto::keys::PublicKey::from_bytes(dev_bytes).expect("Invalid dev key");
 
-    let peers = Arc::new(PeersManager::new(our_key.clone()));
-    let tofu = Arc::new(StdMutex::new(TofuStore::new()));
+    let metrics: SharedMetrics = Arc::new(NodeMetrics::new());
+    let peers = Arc::new(PeersManager::new(our_key.clone(), metrics.clone(), storage.clone()));
+    let tofu = Arc::new(tokio::sync::Mutex::new(TofuStore::new()));
     let dht = Arc::new(StdMutex::new(Dht::new(blake3::hash(&miner_pubkey.to_bytes()).into())));
     let replication = Arc::new(StdMutex::new(EncryptedReplication::new(Some(our_key.clone()), 1000)));
     let orchestrator = Arc::new(StdMutex::new(ChainOrchestrator::recover(&storage.lock().unwrap())));
     let network_height = Arc::new(StdMutex::new(max_height));
     let last_peer_discovery = Arc::new(StdMutex::new(Instant::now()));
-    let balance_cache = Arc::new(StdMutex::new(BalanceCache { balances: BTreeMap::new(), last_update: Instant::now() }));
+    let balance_cache: SharedBalanceCache = Arc::new(StdMutex::new(BalanceCache::new()));
 
     let our_node_id: [u8; 32] = blake3::hash(&miner_pubkey.to_bytes()).into();
     let dht_integration = Arc::new(StdMutex::new(DhtIntegration::new(our_node_id, config.listen_socket_addr(), peers.clone())));
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    ctrlc::set_handler({ let s = shutdown.clone(); move || { tracing::info!("Ctrl+C"); s.store(true, Ordering::SeqCst); } }).expect("Ctrl+C handler");
 
     let sync_ctx = Arc::new(SyncContext {
         validator: validator.clone(), storage: storage.clone(),
@@ -166,10 +161,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sync_phase: Arc::new(parking_lot::Mutex::new(SyncPhase::Idle)),
         sync_peer: Arc::new(parking_lot::Mutex::new(None)),
         pending_solo_requests: Arc::new(StdMutex::new(Vec::new())),
+        metrics: metrics.clone(),
     });
-
-    let shutdown = Arc::new(AtomicBool::new(false));
-    ctrlc::set_handler({ let s = shutdown.clone(); move || { tracing::info!("Ctrl+C"); s.store(true, Ordering::SeqCst); } }).expect("Ctrl+C handler");
 
     // Sync Timeout Checker
     let tm_ctx = sync_ctx.clone(); let tm_peers = peers.clone(); let tm_shutdown = shutdown.clone();
@@ -179,17 +172,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let psc_ctx = sync_ctx.clone(); let psc_shutdown = shutdown.clone();
     std::thread::spawn(move || { while !psc_shutdown.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_secs(config.pending_solo_cleanup_interval_secs)); cleanup_pending_solo_requests(&psc_ctx); } });
 
+    // Ban cleanup + flush PeerDb
+    let ban_peers = peers.clone(); let ban_shutdown = shutdown.clone();
+    std::thread::spawn(move || { while !ban_shutdown.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_secs(600)); ban_peers.cleanup_bans(); ban_peers.flush_known_addresses(); } });
+
     // HTTP Server
-    aevum_node::http_server::start(
-        config.clone(), validator.clone(), mempool.clone(), peers.clone(),
-        storage.clone(), network_height.clone(), balance_cache.clone(),
-        miner_pubkey.clone(), shutdown.clone(),
-    );
+    let http_config = config.clone();
+    let http_validator = validator.clone();
+    let http_mempool = mempool.clone();
+    let http_peers = peers.clone();
+    let http_storage = storage.clone();
+    let http_network_height = network_height.clone();
+    let http_balance_cache = balance_cache.clone();
+    let http_miner_pubkey = miner_pubkey.clone();
+    let http_shutdown = shutdown.clone();
+    let http_metrics = metrics.clone();
+    std::thread::spawn(move || {
+        aevum_node::http_server::start(
+            http_config, http_validator, http_mempool, http_peers,
+            http_storage, http_network_height, http_balance_cache,
+            http_miner_pubkey, http_shutdown, http_metrics,
+        );
+    });
 
     // ATP Server
     aevum_node::atp_server::start(
         config.listen_addr.clone(), peers.clone(), sync_ctx.clone(), our_key.clone(),
-        tofu.clone(), config.bootstrap_peers.clone(), shutdown.clone(),
+        tofu.clone(), shutdown.clone(),
     );
 
     // Mining Loop
@@ -200,6 +209,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             developer_address, serial_counter.clone(), peers.clone(), sync_ctx.clone(),
             network_height.clone(), last_peer_discovery.clone(), our_key.clone(),
             tofu.clone(), dht_integration.clone(), connect_tx, shutdown.clone(),
+            balance_cache.clone(), metrics.clone(),
         );
     }
 
@@ -209,10 +219,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sync_ctx.clone(), dht_integration, shutdown.clone(),
     );
 
+    // Connection Manager
+    let cm = ConnectionManager::new(
+        peers.clone(), sync_ctx.clone(), our_key.clone(), tofu.clone(),
+        config.bootstrap_peers.clone(), shutdown.clone(),
+    );
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2).thread_name("aevum-connmgr").enable_all().build().unwrap();
+        rt.block_on(async move { cm.run().await; });
+    });
+
     // Orchestrator Loop
     aevum_node::orchestrator_loop::start(
         validator.clone(), storage.clone(), network_height.clone(),
         peers.clone(), orchestrator.clone(), sync_ctx.sync_phase.clone(), shutdown.clone(),
+        metrics.clone(),
     );
 
     // Heartbeat
@@ -225,7 +247,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    tracing::info!("🚀 Aevum Node v0.7.0 — ATP Protocol");
+    tracing::info!("🚀 Aevum Node v0.9.32 — ATP Protocol");
     while !shutdown.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_secs(1)); }
     Ok(())
 }

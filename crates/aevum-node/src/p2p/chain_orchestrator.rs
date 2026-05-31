@@ -203,6 +203,17 @@ impl ChainOrchestrator {
         Ok(true)
     }
 
+    /// Облегчённая проверка для соло-блоков — без проверки prev_hash
+    fn verify_block_solo(&self, block: &Block, h: u64) -> Result<bool, OrchestratorError> {
+        if block.compute_hash() != block.block_hash { return Err(OrchestratorError::InvalidBlock { height: h, expected_hash: block.compute_hash().to_hex(), got_hash: block.block_hash.to_hex() }); }
+        if block.poh_tick_end <= block.poh_tick_start { return Err(OrchestratorError::InvalidPoh { height: h, tick_start: block.poh_tick_start, tick_end: block.poh_tick_end }); }
+        if block.transactions.is_empty() { return Err(OrchestratorError::ValidationFailed { height: h, reason: "Empty".into() }); }
+        let cb = block.transactions.iter().filter(|tx| tx.inputs.is_empty()).count();
+        if cb > 1 { return Err(OrchestratorError::ValidationFailed { height: h, reason: "Multi coinbase".into() }); }
+        if cb == 0 { return Err(OrchestratorError::ValidationFailed { height: h, reason: "No coinbase".into() }); }
+        Ok(true)
+    }
+
     fn analyze(&mut self, block: &Block, h: u64) { let n = block.transactions.len(); let s: u64 = block.transactions.iter().flat_map(|tx| tx.outputs.iter()).map(|o| o.amount).sum(); tracing::debug!("[ORCH] Block {}: {} txs, {} AEV", h, n, s as f64 / 100_000_000.0); }
     fn distribute(&mut self, block: &Block) { for tx in &block.transactions { if tx.inputs.is_empty() { for o in &tx.outputs { self.metrics.rewards_distributed += o.amount; } } } }
 
@@ -279,6 +290,9 @@ impl ChainOrchestrator {
         result
     }
 
+    // ========================================================================
+    // ИСПРАВЛЕННАЯ accept_solo_chain
+    // ========================================================================
     pub fn accept_solo_chain(&mut self, peer_id: &[u8; 20], blocks: &[Block], val: &mut Validator, st: &mut Storage) -> Result<(u64, u64, f64), OrchestratorError> {
         if blocks.is_empty() { return Err(OrchestratorError::ValidationFailed { height: 0, reason: "Empty solo chain".into() }); }
         let first_hash = blocks[0].block_hash.0;
@@ -287,18 +301,25 @@ impl ChainOrchestrator {
             return Err(OrchestratorError::DuplicateSoloChain { peer_id: hex::encode(peer_id), first_block_hash: hex::encode(&first_hash) });
         }
 
+        let our_height = val.last_block_height();
         let mut total_poh_ticks: u64 = 0;
         let mut coinbase_amount: u64 = 0;
         let mut miner_key: Option<PublicKey> = None;
         let mut unique_blocks: u64 = 0;
+        let mut max_height: u64 = our_height;
 
         for block in blocks {
             let h = block.height;
-            if !self.verify_block(block, h, st)? { return Err(OrchestratorError::ValidationFailed { height: h, reason: "Block verification failed".into() }); }
-            if let Ok(Some(main_block)) = st.load_my_block(h) { if main_block.block_hash == block.block_hash { continue; } }
+            // 🔥 ПРОПУСКАЕМ блоки не выше нашей высоты
+            if h <= our_height { continue; }
+            // 🔥 ИСПОЛЬЗУЕМ облегчённую проверку БЕЗ prev_hash
+            if !self.verify_block_solo(block, h)? { continue; }
+            // Пропускаем дубликаты
+            if let Ok(Some(existing)) = st.load_my_block(h) { if existing.block_hash == block.block_hash { continue; } }
             let block_ticks = block.poh_tick_end.saturating_sub(block.poh_tick_start);
             total_poh_ticks = total_poh_ticks.saturating_add(block_ticks);
             unique_blocks += 1;
+            if h > max_height { max_height = h; }
             for tx in &block.transactions {
                 if tx.inputs.is_empty() {
                     for o in &tx.outputs {
@@ -309,7 +330,7 @@ impl ChainOrchestrator {
             }
         }
 
-        if unique_blocks == 0 { return Err(OrchestratorError::ValidationFailed { height: 0, reason: "All blocks duplicate with main chain".into() }); }
+        if unique_blocks == 0 { return Err(OrchestratorError::ValidationFailed { height: 0, reason: "All blocks below our height or duplicate".into() }); }
         let miner = miner_key.ok_or(OrchestratorError::ValidationFailed { height: 0, reason: "No miner found".into() })?;
 
         let normative_ticks = unique_blocks.saturating_mul(TICKS_PER_BLOCK);
@@ -318,25 +339,37 @@ impl ChainOrchestrator {
         let standard_total = unique_blocks.saturating_mul(standard_reward_per_block);
         let fair_reward = (standard_total as f64 * fairness_coefficient) as u64;
 
+        // Сохраняем только новые блоки
         for block in blocks {
-            st.save_my_block(block.height, block).map_err(|e| OrchestratorError::StorageFailed { operation: "save_solo".into(), detail: format!("{:?}", e) })?;
+            if block.height > our_height {
+                st.save_my_block(block.height, block).map_err(|e| OrchestratorError::StorageFailed { operation: "save_solo".into(), detail: format!("{:?}", e) })?;
+            }
         }
 
+        // Начисляем награду
         if fair_reward > 0 {
-            let utxo = JtUtxo::new_global_clean(miner, fair_reward, &[1u8; 32], &[1u8; 32], blocks.last().map(|b| b.height).unwrap_or(0), 0, Hash::zero())
+            let utxo = JtUtxo::new_global_clean(miner, fair_reward, &[1u8; 32], &[1u8; 32], max_height, 0, Hash::zero())
                 .map_err(|_| OrchestratorError::ValidationFailed { height: 0, reason: "Failed to create reward UTXO".into() })?;
             val.utxo_set_mut().add(utxo);
+        }
+
+        // 🔥 КРИТИЧЕСКИЙ ФИКС: обновляем высоту валидатора
+        if max_height > our_height {
+            if let Some(last_block) = blocks.iter().find(|b| b.height == max_height) {
+                val.set_last_block(last_block.block_hash, max_height, last_block.poh_tick_end);
+                tracing::info!("[ORCH] Validator height updated: {} -> {}", our_height, max_height);
+            }
         }
 
         self.accepted_solo_chains.insert(chain_key);
         self.metrics.solo_blocks_accepted = self.metrics.solo_blocks_accepted.saturating_add(unique_blocks);
         self.metrics.solo_rewards_distributed = self.metrics.solo_rewards_distributed.saturating_add(fair_reward);
         self.metrics.miners_synchronized = self.metrics.miners_synchronized.saturating_add(1);
-        self.wal.log(st, "accept_solo_chain", blocks.last().map(|b| b.height).unwrap_or(0), None)?;
+        self.wal.log(st, "accept_solo_chain", max_height, None)?;
         self.save_progress(st)?;
 
-        tracing::info!("[ORCH] Solo chain accepted: peer={}, blocks={}, unique={}, poh_ticks={}, normative_ticks={}, coefficient={:.4}, coinbase_raw={}, fair_reward={} ({} AEV)",
-            hex::encode(peer_id), blocks.len(), unique_blocks, total_poh_ticks, normative_ticks, fairness_coefficient, coinbase_amount, fair_reward, fair_reward as f64 / 100_000_000.0);
+        tracing::info!("[ORCH] Solo chain accepted: peer={}, blocks={}, unique={}, poh_ticks={}, normative={}, coeff={:.4}, reward={} ({} AEV), height: {} -> {}",
+            hex::encode(peer_id), blocks.len(), unique_blocks, total_poh_ticks, normative_ticks, fairness_coefficient, fair_reward, fair_reward as f64 / 100_000_000.0, our_height, max_height);
         Ok((unique_blocks, fair_reward, fairness_coefficient))
     }
 }
