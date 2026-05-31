@@ -12,7 +12,7 @@ use crate::storage::Storage;
 use crate::sync::ChainSync;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::collections::HashSet;
-use libp2p::PeerId;
+pub type PeerId = [u8; 20];
 
 pub struct NodeContext {
     pub validator: Arc<StdMutex<Validator>>,
@@ -65,6 +65,8 @@ pub mod addr_manager;
 pub mod snapshots;
 pub use noise::AtpCipher as NoiseCipher;
 pub mod pex;
+pub mod peer_db;
+pub mod connection_manager;
 pub mod chain_orchestrator;
 pub mod genesis_sync;
 pub mod dht_integration;
