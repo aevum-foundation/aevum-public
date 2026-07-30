@@ -1,21 +1,60 @@
 # Aevum Protocol — Sovereign Compute Layer
 
-Aevum is a Layer-1 blockchain built from scratch in Rust. Instead of wasteful mining, it uses **Proof of Useful Physical Reality (PoUPR)** — GPU/CPU work that actually matters. Instead of transparent UTXOs, it uses **confidential JT-UTXOs with auditability**. Instead of censorship, it uses **Prisma — compliance through mathematics, not through blocking**.
+**Aevum is a Layer-1 blockchain built from scratch in Rust.**
 
-## Protocol at a Glance
-- **Max Supply:** 371,000,000 AEV
-- **Genesis Supply:** 21,000,000 AEV
-- **Block Time:** 5 minutes (PoH-driven)
-- **Architecture:** 25 crates, 200+ modules, 55,000+ lines of Rust
-- **Consensus:** Proof of Presence + DNA-anchored emission
+It combines post-quantum security, confidential transactions, useful mining, and compliance without censorship into a single sovereign protocol.
 
-## Why Aevum is Different
-- **JT-UTXO:** Confidentiality and auditability built into the protocol — not an afterthought.
-- **Prisma:** Risk scoring without censorship. We warn, we don't freeze.
-- **DNA:** Full asset provenance with built-in protection against censorship.
-- **PQ-Stack:** Post-quantum ready (ML-KEM, ML-DSA, SLH-DSA) — NIST FIPS 203/204/205 aligned.
-- **Onion Routing:** Tor-style anonymity integrated at the network level.
-- **LoRa Mesh:** Physical-layer radio mesh for permissionless communication.
+---
 
-## Repository Purpose
-This repository contains **public documentation** and the **full module structure** of the protocol. The source code itself is closed until the core development reaches a stable milestone. We share the architecture — not the implementation.
+## 🔹 Why Aevum?
+
+| Problem | Aevum Solution |
+| :--- | :--- |
+| Wasteful mining | **PoUPR** — useful mining (GPU/CPU for science & AI) |
+| Censorship | **Prisma** — compliance through math, not blocking |
+| No privacy | **JT-UTXO** — confidential transactions with auditability |
+| Quantum threat | **PQ-Stack** — ML-KEM, ML-DSA, SLH-DSA (NIST FIPS 203/204/205) |
+| Forks | **Proof of Presence** — epoch-based consensus, forks are irrelevant |
+| Centralized networks | **Onion Routing + LoRa Mesh** — network-level anonymity |
+
+---
+
+## 🔹 Technology Stack
+
+| Layer | Technology |
+| :--- | :--- |
+| **Language** | Rust (55k+ lines, 25 crates, 200+ modules) |
+| **Consensus** | Proof of Presence (epoch-based, no PoW/PoS race) |
+| **Privacy** | JT-UTXO (confidential transactions with audit) |
+| **Compliance** | Prisma (warn, don't freeze) |
+| **Post-Quantum** | ML-KEM-768, ML-DSA-65, SLH-DSA |
+| **Network** | Onion Routing + LoRa Mesh |
+| **Storage** | Custom LSM engine (WAL + SSTable + hash-chain) |
+| **Mining** | PoUPR (GPU/CPU for real-world tasks) |
+
+---
+
+## 🔹 Repository Purpose
+
+This repository contains the **public architecture and documentation** of the Aevum Protocol.
+
+- ✅ Full module structure (25 crates, 200+ modules)
+- ✅ Technical documentation
+- ✅ Node roles and reward mechanics
+- ✅ Open strategy and roadmap
+
+The source code is **closed until the community matures** — to protect the protocol from forks and preserve its uniqueness.
+
+---
+
+## 🔹 Links
+
+- **GitHub**: github.com/aevum-foundation/aevum-public
+- **Telegram**: t.me/aevum_protocol
+- **Website**: aevumchain.com
+
+---
+
+**Study the architecture. Join the community. Run a node when ready.**
+
+**No hype — only engineering.**
