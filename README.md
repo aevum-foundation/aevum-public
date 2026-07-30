@@ -50,7 +50,7 @@ The source code is **closed until the community matures** — to protect the pro
 ## 🔹 Links
 
 - **GitHub**: github.com/aevum-foundation/aevum-public
-- **Telegram**: t.me/aevum_protocol
+- **Telegram**: t.me/aevumchain
 - **Website**: aevumchain.com
 
 ---
