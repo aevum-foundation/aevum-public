@@ -1,4 +1,4 @@
-//! LedgerEntry v1 — Универсальная запись леджера Aevum
+//! LedgerEntry v1 — Universal Aevum ledger record
 
 use serde::{Deserialize, Serialize};
 use crate::crypto::hash::Hash;
