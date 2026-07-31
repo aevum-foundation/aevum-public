@@ -1,15 +1,15 @@
 //! BloomFilter v1.1 — Probabilistic key existence filter for SST files
 //!
-//! ## Исправления с v1.0
-//! - [P1-1] `add()`: guard на пустой фильтр
-//! - [P1-2] `double_hash()`: h2 | 1 гарантирует ненулевой второй хеш
-//! - [P2] Убран лишний +4 в `to_bytes` capacity
-//! - [P2] Тесты на corrupted/truncated `from_bytes`
+//! ## Fixes from v1.0
+//! - [P1-1] `add()`: guard against empty filter
+//! - [P1-2] `double_hash()`: h2 | 1 guarantees non-zero second hash
+//! - [P2] Removed unnecessary +4 in `to_bytes` capacity
+//! - [P2] Tests for corrupted/truncated `from_bytes`
 //!
-//! ## Параметры
-//! - `bits_per_key`: 10 = ~0.8% false positive rate (7 хеш-функций)
-//! - Хеш-функция: двойное хеширование Kirsch-Mitzenmacher (h1 + i·h2)
-//! - Память: ~1.25 байта на ключ (10 бит / 8)
+//! ## Parameters
+//! - `bits_per_key`: 10 = ~0.8% false positive rate (7 hash functions)
+//! - Hash function: Kirsch-Mitzenmacher double hashing (h1 + i·h2)
+//! - Memory: ~1.25 bytes per key (10 bits / 8)
 
 use std::hash::{Hash, Hasher};
 
@@ -21,11 +21,11 @@ pub struct BloomFilter {
 }
 
 impl BloomFilter {
-    /// Создать новый фильтр Блума.
+    /// Create a new Bloom filter.
     ///
-    /// # Аргументы
-    /// * `expected_keys` — ожидаемое количество ключей
-    /// * `bits_per_key` — бит на ключ (10 = ~0.8% FP, 7 = ~10% FP)
+    /// # Arguments
+    /// * `expected_keys` — expected number of keys
+    /// * `bits_per_key` — bits per key (10 = ~0.8% FP, 7 = ~10% FP)
     pub fn new(expected_keys: usize, bits_per_key: u32) -> Self {
         let bits_per_key = bits_per_key.max(1);
         let bits = (expected_keys * bits_per_key as usize).max(64);
@@ -40,8 +40,8 @@ impl BloomFilter {
         }
     }
 
-    /// Создать фильтр из готовых данных (при загрузке SST).
-    /// Если bits пуст — создаётся минимальный фильтр (1 слово).
+    /// Create a filter from raw data (for loading SST).
+    /// If bits is empty — creates a minimal filter (1 word).
     pub fn from_raw(bits: Vec<u64>, num_hashes: u32) -> Self {
         let bits = if bits.is_empty() { vec![0u64; 1] } else { bits };
         BloomFilter {
@@ -51,7 +51,7 @@ impl BloomFilter {
         }
     }
 
-    /// Добавить ключ в фильтр.
+    /// Add a key to the filter.
     pub fn add<T: Hash>(&mut self, key: &T) {
         if self.bits.is_empty() {
             return;
@@ -64,8 +64,8 @@ impl BloomFilter {
         self.count += 1;
     }
 
-    /// Проверить, может ли ключ присутствовать.
-    /// `false` = ключ точно отсутствует. `true` = возможно присутствует.
+    /// Check if a key may be present.
+    /// `false` = key is definitely absent. `true` = may be present.
     pub fn may_contain<T: Hash>(&self, key: &T) -> bool {
         if self.bits.is_empty() || self.num_hashes == 0 {
             return false;
@@ -80,27 +80,27 @@ impl BloomFilter {
         true
     }
 
-    /// Количество добавленных ключей (не сохраняется при сериализации).
+    /// Number of added keys (not preserved during serialization).
     pub fn count(&self) -> usize {
         self.count
     }
 
-    /// Размер фильтра в байтах.
+    /// Filter size in bytes.
     pub fn size_bytes(&self) -> usize {
         self.bits.len() * 8
     }
 
-    /// Количество хеш-функций.
+    /// Number of hash functions.
     pub fn num_hashes(&self) -> u32 {
         self.num_hashes
     }
 
-    /// Сырые биты для сериализации.
+    /// Raw bits for serialization.
     pub fn bits(&self) -> &[u64] {
         &self.bits
     }
 
-    /// Сериализовать в Vec<u8>.
+    /// Serialize to Vec<u8>.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(4 + self.bits.len() * 8);
         out.extend_from_slice(&(self.num_hashes as u32).to_le_bytes());
@@ -110,8 +110,8 @@ impl BloomFilter {
         out
     }
 
-    /// Десериализовать из байтов.
-    /// Возвращает None если данные повреждены или слишком короткие.
+    /// Deserialize from bytes.
+    /// Returns None if data is corrupted or too short.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < 8 {
             return None;
@@ -121,7 +121,7 @@ impl BloomFilter {
         if words == 0 {
             return None;
         }
-        // Проверяем что данные не содержат мусора в хвосте
+        // Check that data doesn't contain garbage in the tail
         if (data.len() - 4) % 8 != 0 {
             return None;
         }
@@ -141,10 +141,10 @@ impl BloomFilter {
         })
     }
 
-    // ─── Внутренние ──────────────────────────────────
+    // ─── Internal ──────────────────────────────────
 
-    /// Двойное хеширование: h1 + i·h2 (Kirsch-Mitzenmacher).
-    /// h2 гарантированно нечётный и ненулевой через | 1.
+    /// Double hashing: h1 + i·h2 (Kirsch-Mitzenmacher).
+    /// h2 is guaranteed odd and non-zero via | 1.
     fn double_hash<T: Hash>(&self, key: &T) -> (u64, u64) {
         let h1 = self.hash_key(key, 0x5bd1e995);
         let h2 = self.hash_key(key, 0xc6a4a793) | 1;
@@ -244,8 +244,8 @@ mod tests {
 
     #[test]
     fn test_from_bytes_truncated() {
-        // 9 байт — не кратно 8 (мусор в хвосте)
-        let data = vec![0u8; 13]; // 4 + 9 = ни 8 ни 16
+        // 9 bytes — not a multiple of 8 (garbage in tail)
+        let data = vec![0u8; 13]; // 4 + 9 = neither 8 nor 16
         assert!(BloomFilter::from_bytes(&data).is_none());
     }
 
@@ -291,17 +291,17 @@ mod tests {
     #[test]
     fn test_from_raw_empty() {
         let bloom = BloomFilter::from_raw(vec![], 7);
-        // Должен создать минимальный фильтр, не паниковать при add
+        // Should create a minimal filter, not panic on add
         assert_eq!(bloom.num_hashes(), 7);
-        // may_contain на пустом должен работать
+        // may_contain on empty should work
         assert!(!bloom.may_contain(b"anything"));
     }
 
     #[test]
     fn test_add_on_empty_raw_does_not_panic() {
         let mut bloom = BloomFilter::from_raw(vec![], 7);
-        bloom.add(b"test"); // не должен паниковать
-        // h2 | 1 гарантирует что второй хеш не ноль
+        bloom.add(b"test"); // should not panic
+        // h2 | 1 guarantees non-zero second hash
         let (h1, h2) = bloom.double_hash(b"test");
         assert!(h2 != 0, "h2 must be non-zero");
     }
