@@ -1,6 +1,6 @@
 //! Aevum L1 Consensus Specification v2.0
 //!
-//! spec.rs = ТОЛЬКО константы и re-export. Логика в rules/*.
+//! spec.rs = Constants and re-exports only. Logic lives in rules/*.
 
 pub const MAX_BLOCK_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_TRANSACTIONS: usize = 100_000;
@@ -22,7 +22,7 @@ pub use crate::consensus::rules::fork;
 mod tests {
     use super::*;
 
-    /// Compile-time check: функция существует и доступна.
+    /// Compile-time check: function exists and is accessible.
     fn assert_fn<T>(_f: T) {}
 
     #[test]
