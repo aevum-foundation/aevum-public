@@ -1,16 +1,16 @@
-//! Типы ошибок AevumDB — production-grade.
+//! AevumDB error types — production-grade.
 //!
 //! ## Severity
-//! - **Fatal** — коррупция, потеря WAL (немедленная остановка)
-//! - **Recoverable** — IO, блокировки, backpressure, partial recovery
-//! - **User** — некорректный запрос или конфигурация
+//! - **Fatal** — corruption, WAL loss (immediate shutdown)
+//! - **Recoverable** — I/O, locks, backpressure, partial recovery
+//! - **User** — invalid request or configuration
 //!
 //! ## Error codes
 //! - 1xxx: I/O + backpressure
-//! - 2xxx: Целостность
-//! - 3xxx: Пользовательские
-//! - 4xxx: Конфигурация
-//! - 5xxx: Внутренние
+//! - 2xxx: Integrity
+//! - 3xxx: User
+//! - 4xxx: Configuration
+//! - 5xxx: Internal
 
 use aevum::reexport::{hex, bincode, blake3};
 use std::fmt;
@@ -81,7 +81,7 @@ pub enum DbError {
     DirectoryNotFound(PathBuf),
     CompactionBackpressure { queued_files: usize, max_files: usize },
 
-    // Целостность
+    // Integrity
     WalCorrupted { segment: u64, offset: u64, expected: [u8; 32], actual: [u8; 32] },
     SstableCorrupted { path: PathBuf, offset: u64, expected: [u8; 32], actual: [u8; 32] },
     MemtableCorrupted { context: &'static str },
@@ -95,7 +95,7 @@ pub enum DbError {
     RecoveryFailed { reason: &'static str },
     RecoveryPartial { recovered: usize, total: usize },
 
-    // Пользовательские
+    // User
     NotFound { key_hash: [u8; 32], key_len: usize },
     AlreadyOpen { path: PathBuf, holder_pid: Option<u32> },
     Closed,
@@ -107,12 +107,12 @@ pub enum DbError {
     UtxoSpent { tx_hash: [u8; 32], output_index: u32 },
     UtxoInvalid { context: &'static str },
 
-    // Конфигурация
+    // Configuration
     Config(&'static str),
-    // Управление кэшем
+    // Cache management
     CacheFull { current: usize, max: usize },
 
-    // Внутренние
+    // Internal
     Serialization { context: &'static str },
     Crypto(&'static str),
     Internal { code: u32, context: &'static str },
@@ -193,7 +193,7 @@ impl DbError {
             | DbError::UtxoSpent { .. }
             | DbError::UtxoInvalid { .. }
             | DbError::CacheFull { .. } => Severity::Recoverable,
-            | DbError::Config(_) => Severity::User,
+            DbError::Config(_) => Severity::User,
         }
     }
 
@@ -214,7 +214,7 @@ impl DbError {
 
     pub fn should_throttle(&self) -> bool { self.retry_after().is_some() }
 
-    // ── Конструкторы ──────────────────────────────────
+    // ── Constructors ──────────────────────────────────
 
     pub fn io(source: io::Error, path: impl Into<PathBuf>, context: &'static str) -> Self {
         let code = match source.kind() {
@@ -297,9 +297,13 @@ impl DbError {
     pub fn backpressure(queued_files: usize, max_files: usize) -> Self {
         DbError::CompactionBackpressure { queued_files, max_files }
     }
+
+    pub fn cache_full(current: usize, max: usize) -> Self {
+        DbError::CacheFull { current, max }
+    }
 }
 
-// ─── Display (унифицированный формат) ────────────────────
+// ─── Display (unified format) ────────────────────────────────────
 
 impl fmt::Display for DbError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -394,10 +398,10 @@ impl fmt::Display for DbError {
             DbError::UtxoInvalid { context } => {
                 write!(f, "[E{}] invalid UTXO: {}", code, context)
             }
-            DbError::CacheFull { current, max } => {
-                write!(f, "[E{}] table cache full: {}/{} files open", code, current, max)
-            }
             DbError::Config(msg) => write!(f, "[E{}] invalid configuration: {}", code, msg),
+            DbError::CacheFull { current, max } => {
+                write!(f, "[E{}] cache full: {} entries (max {})", code, current, max)
+            }
             DbError::Serialization { context } => {
                 write!(f, "[E{}] serialization error: {}", code, context)
             }
@@ -439,7 +443,7 @@ impl From<bincode::Error> for DbError {
     }
 }
 
-// ─── Тесты ────────────────────────────────────────────────
+// ─── Tests ────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -504,7 +508,8 @@ mod tests {
             ErrorCode::SequenceOverflow,
             ErrorCode::InvalidKey, ErrorCode::InvalidValue, ErrorCode::BatchTooLarge,
             ErrorCode::SnapshotExpired, ErrorCode::UtxoSpent, ErrorCode::UtxoInvalid,
-            ErrorCode::ConfigInvalid, ErrorCode::Serialization, ErrorCode::Crypto, ErrorCode::Internal,
+            ErrorCode::ConfigInvalid, ErrorCode::CacheFull,
+            ErrorCode::Serialization, ErrorCode::Crypto, ErrorCode::Internal,
         ];
         let unique: HashSet<_> = codes.iter().map(|c| *c as u32).collect();
         assert_eq!(unique.len(), codes.len());
