@@ -11,7 +11,6 @@ use rand::seq::SliceRandom;
 use tokio::sync::mpsc;
 
 use aevum::crypto::keys::PrivateKey;
-
 use crate::p2p::router::P2pRouter;
 use crate::peer_storage::PeerStorage;
 
