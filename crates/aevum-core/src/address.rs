@@ -3,7 +3,7 @@ use crate::crypto::hash::Hash;
 use crate::crypto::keys::PublicKey;
 use serde::{Serialize, Deserialize};
 
-/// Политика приёма UTXO.
+/// UTXO acceptance policy.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AcceptancePolicy {
     Whitelist(Vec<AcceptanceRule>),
@@ -102,11 +102,11 @@ impl AcceptanceRule {
     }
 }
 
-/// Aevum-адрес с Prisma-политикой.
+/// Aevum address with Prisma policy.
 ///
-/// ## Версионирование
-/// - **0x01 (Legacy):** blake3-деривация, для существующих адресов
-/// - **0x02 (Standard):** BIP44-деривация `m/44'/789'/0'/0/{index}`
+/// ## Versioning
+/// - **0x01 (Legacy):** blake3 derivation for existing addresses
+/// - **0x02 (Standard):** BIP44 derivation `m/44'/789'/0'/0/{index}`
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Address {
     pub public_key: PublicKey,
@@ -119,13 +119,13 @@ impl Address {
     pub const LEGACY_VERSION: u8 = 0x01;
     const DOMAIN_SEPARATOR: &[u8] = b"AEVUM_ADDRESS_POLICY_V3";
 
-    /// Создать адрес с политикой.
+    /// Create address with policy.
     pub fn new(public_key: PublicKey, policy: &AcceptancePolicy) -> Self {
         let policy_hash = Self::compute_policy_hash(&public_key, policy);
         Address { public_key, policy_hash, version: Self::CURRENT_VERSION }
     }
 
-    /// Создать адрес с указанной версией.
+    /// Create address with a specified version.
     pub fn with_version(public_key: PublicKey, policy: &AcceptancePolicy, version: u8) -> Self {
         let policy_hash = Self::compute_policy_hash(&public_key, policy);
         Address { public_key, policy_hash, version }
@@ -193,8 +193,8 @@ mod tests {
         let policy = AcceptancePolicy::AcceptAll;
         let addr1 = Address::with_version(pk.clone(), &policy, 0x01);
         let addr2 = Address::with_version(pk, &policy, 0x02);
-        // Разные версии — разные хеши политик
-        // (если domain separator включает version)
+        // Different versions produce different policy hashes
+        // (when domain separator includes version)
         assert!(addr1.version != addr2.version);
     }
 }
