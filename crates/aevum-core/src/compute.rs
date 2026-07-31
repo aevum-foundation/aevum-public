@@ -1,9 +1,9 @@
 //! Compute Task types for Aevum protocol (v2 — Hardened Deterministic)
 //!
 //! ## v2 Upgrades
-//! - TaskType: Ord + PartialOrd, Custom с [u8; 32] namespace
-//! - get_chunk с remainder распределением
-//! - Убран f64 (полный детерминизм)
+//! - TaskType: Ord + PartialOrd, Custom with [u8; 32] namespace
+//! - get_chunk with remainder distribution
+//! - f64 removed (full determinism)
 //! - Domain-separated hashing
 //! - Comprehensive tests
 
