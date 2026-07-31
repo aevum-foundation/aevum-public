@@ -1,7 +1,7 @@
 //! PresenceRecord v2 — Epoch Data DAG
-//! Каждая запись ссылается на множество родительских записей.
-//! Устойчив к потере отдельных записей.
-//! sequence — локальный счётчик ноды, не глобальный порядок.
+//! Each record references multiple parent records.
+//! Resilient to loss of individual records.
+//! sequence is a local node counter, NOT global ordering.
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::hash::Hash;
@@ -43,7 +43,7 @@ pub struct PresenceRecord {
     pub record_type: PresenceRecordType,
     pub timestamp: u64,
     pub transactions: Vec<Transaction>,
-    /// Канонизированный список родительских записей (sorted, deduped)
+    /// Canonical list of parent records (sorted, deduped)
     pub parent_records: Vec<Hash>,
     pub record_hash: Hash,
     pub signature: crate::crypto::signature::SignatureBytes,
@@ -95,7 +95,7 @@ impl PresenceRecord {
         for tx in &self.transactions {
             h.update(tx.tx_hash.as_bytes());
         }
-        // parent_records уже канонизированы в with_parents
+        // parent_records are already canonicalized in with_parents
         for parent in &self.parent_records {
             h.update(parent.as_bytes());
         }
@@ -115,7 +115,7 @@ impl PresenceRecord {
         if self.timestamp > current_time.saturating_add(MAX_RECORD_FUTURE_DRIFT_SECS) {
             return Err("timestamp too far in future");
         }
-        // Канонизация родительских хешей
+        // Canonicalize parent hashes
         self.parent_records.sort();
         self.parent_records.dedup();
         self.record_hash = self.compute_hash();
@@ -135,7 +135,7 @@ impl PresenceRecord {
     }
 }
 
-/// Проверить что добавление записи не создаст цикл в DAG эпохи
+/// Verify that adding a record does not create a cycle in the epoch DAG
 pub fn verify_dag_acyclic(
     record: &PresenceRecord,
     epoch_records: &std::collections::HashMap<Hash, PresenceRecord>,
@@ -147,7 +147,7 @@ pub fn verify_dag_acyclic(
         if current == record.record_hash && !stack.is_empty() { continue; }
         if let Some(r) = epoch_records.get(&current) {
             for parent in &r.parent_records {
-                if *parent == record.record_hash { return false; } // цикл
+                if *parent == record.record_hash { return false; } // cycle detected
                 stack.push(*parent);
             }
         }
