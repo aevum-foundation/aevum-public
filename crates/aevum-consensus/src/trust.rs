@@ -1,13 +1,13 @@
 //! Trust Model v6 — Deterministic Delegate Consensus (Production)
 //!
 //! ## v6 Upgrades
-//! - trust_root: криптографический commitment delegates
+//! - trust_root: cryptographic commitment of delegates
 //! - current_epoch + advance_epoch
 //! - max_delegates + revoke
 //! - quorum = 2/3 network_size
-//! - verify_root для аудита
-//! - BTreeSet для детерминизма
-//! - saturating_* везде
+//! - verify_root for audit
+//! - BTreeSet for determinism
+//! - saturating_* everywhere
 
 use serde::{Serialize, Deserialize};
 use std::collections::BTreeSet;
