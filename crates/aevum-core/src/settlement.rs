@@ -1,8 +1,5 @@
-//! SettlementBlock v2 — Консенсусный блок финализации эпохи
-//! Строгая цепочка: Genesis → Settlement(0) → Settlement(1) → ...
-//! epoch_root = Merkle(presence_root, transaction_root, state_root,
-//!                     reward_root, participant_root, epoch_snapshot_root)
-//! Комитет подписывает (epoch_commitment || block_hash).
+//! SettlementBlock v2 — Final settlement for an epoch
+//! Committee signs (epoch_commitment || block_hash).
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::hash::Hash;
@@ -40,7 +37,7 @@ pub struct SettlementBlock {
 }
 
 impl SettlementBlock {
-    /// Merkle-корень шести data roots
+    /// Merkle root of six data roots
     pub fn compute_epoch_root(&self) -> Hash {
         let roots = [
             self.presence_root.0,
