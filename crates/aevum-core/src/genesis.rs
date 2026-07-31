@@ -1,4 +1,4 @@
-//! GenesisBlock v1 — Создание первоначального состояния
+//! GenesisBlock v1 — Initial state creation
 
 use serde::{Deserialize, Serialize};
 use crate::crypto::hash::Hash;
