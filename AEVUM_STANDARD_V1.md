@@ -11,12 +11,24 @@ Aevum is a **Presence-Provenance Sovereign Compute Protocol**.
 | :--- | :--- |
 | Max Supply | 371,000,000 AEV |
 | Genesis Supply | 21,000,000 AEV |
-| Initial Block Reward | 200 AEV |
+| Block Time | 30 seconds |
+| Blocks per Epoch | 2,880 (~24 hours) |
+| Block Reward | 20 AEV |
+| Epoch Reward | 57,600 AEV |
 | Halving Interval | 867,240 blocks |
-| Tail Emission | 10 AEV |
-| Block Time | 5 minutes |
+| Tail Emission | 10 AEV (after 4 halvings) |
 
-## 3. Network Constants
+## 3. Epoch & Participation
+| Parameter | Value |
+| :--- | :--- |
+| Epoch Length | 2,880 blocks (~24 hours) |
+| Max Participants | 100,000 |
+| Full Nodes (Infrastructure) | 20,000 (20%) |
+| Light Nodes (Queue) | 80,000 (80%) |
+| Full Node Bonus | +12.5% (1.25x) |
+| Bridge Node Bonus | +15% (1.5x) + per-chain bonus |
+
+## 4. Network Constants
 | Parameter | Value |
 | :--- | :--- |
 | Max Peers | 10,000 |
@@ -28,7 +40,7 @@ Aevum is a **Presence-Provenance Sovereign Compute Protocol**.
 | Ban Duration | 86400 sec (24h) |
 | Seen Messages Cache | 100,000 |
 
-## 4. Unique Features
+## 5. Unique Features
 - **JT-UTXO:** Confidentiality + auditability built into the protocol.
 - **Prisma:** Risk scoring without censorship. We warn, we don't freeze.
 - **DNA:** Full asset provenance with built-in anti-censorship.
@@ -37,7 +49,7 @@ Aevum is a **Presence-Provenance Sovereign Compute Protocol**.
 - **Onion Routing:** Tor-style anonymity integrated at the network layer.
 - **LoRa Mesh:** Radio-based peer-to-peer communication.
 
-## 5. Module Map
+## 6. Module Map
 ```
 
 crates/

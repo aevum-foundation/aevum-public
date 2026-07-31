@@ -1,12 +1,12 @@
 # Aevum Protocol — Architecture Overview
 
-The protocol is organized into 25 independent crates, each responsible for a specific layer of the system. Together they form a sovereign compute network.
+The protocol is organized into independent crates, each responsible for a specific layer of the system. Together they form a sovereign compute network.
 
 ## Core Layer
 | Crate | Responsibility |
 | :--- | :--- |
 | `aevum-core` | Blocks, transactions, UTXO, state, DNA, state transitions |
-| `aevum-crypto` | Cryptographic primitives: Ed25519, X25519, BLAKE3, SHA3, ML-KEM, ML-DSA |
+| `aevum-crypto` | Cryptographic primitives: Ed25519, X25519, BLAKE3, SHA3 |
 | `aevum-consensus` | Proof of History (PoH), validator set, block validation |
 | `aevum-node` | Full node: P2P, mempool, sync, HTTP API, mining loop |
 | `aevum-db` | LSM storage engine: WAL + SSTable + compaction |
@@ -42,4 +42,3 @@ The protocol is organized into 25 independent crates, each responsible for a spe
 2.  **Integer-only math:** No f64 — fully deterministic across platforms.
 3.  **Bounded everything:** All vectors have max capacity with LRU eviction.
 4.  **No censorship at network layer:** Network propagation is independent of asset provenance.
-5.  **Post-quantum ready:** All critical paths can be upgraded to ML-DSA/ML-KEM without breaking consensus.
