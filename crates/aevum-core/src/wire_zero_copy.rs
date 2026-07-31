@@ -2,11 +2,11 @@
 //!
 //! ## Design
 //! - Cursor abstraction: safe, bounds-checked, no unwraps
-//! - True zero-copy: все View хранят только ссылки на исходный буфер
-//! - Совместим с каноническим форматом wire.rs (WIRE_VERSION = 5)
-//! - Version validation: несовместимый формат → None
-//! - BlockTxIter: ленивая итерация по транзакциям блока
-//! - TxView.parsed_len: точный размер одной транзакции
+//! - True zero-copy: all Views store only references to the original buffer
+//! - Compatible with canonical wire.rs format (WIRE_VERSION = 5)
+//! - Version validation: incompatible format → None
+//! - BlockTxIter: lazy iteration over block transactions
+//! - TxView.parsed_len: exact size of one transaction
 //!
 //! ## Wire Format (BlockWire)
 //! [version:2][block_hash:32][prev_hash:32][height:8][poh_start:8][poh_end:8]
@@ -14,17 +14,17 @@
 //! [is_presence:1][block_size:8]
 //!
 //! ## Performance
-//! - Block header: 0 аллокаций
-//! - Tx parse: 0 аллокаций, точный parsed_len
-//! - Tx iteration: ленивая, без double-parse
-//! - Память: ~80 байт на BlockView, ~64 байт на TxView
+//! - Block header: 0 allocations
+//! - Tx parse: 0 allocations, exact parsed_len
+//! - Tx iteration: lazy, no double-parse
+//! - Memory: ~80 bytes per BlockView, ~64 bytes per TxView
 
 use crate::crypto::hash::Hash;
 
 pub const EXPECTED_WIRE_VERSION: u16 = 5;
 const BLOCK_HEADER_SIZE: usize = 2 + 32 + 32 + 8 + 8 + 8 + 32 + 4;
 
-/// Безопасный курсор для последовательного чтения из буфера.
+/// Safe cursor for sequential reading from a buffer.
 pub struct Cursor<'a> {
     data: &'a [u8],
     pos: usize,
@@ -97,7 +97,7 @@ impl<'a> Cursor<'a> {
         Some(())
     }
 
-    /// Пропустить TxInput: variable-length signature
+    /// Skip TxInput: variable-length signature
     pub fn skip_inputs(&mut self, count: u32) -> Option<()> {
         for _ in 0..count {
             self.skip(32 + 4 + 32)?;
@@ -108,7 +108,7 @@ impl<'a> Cursor<'a> {
         Some(())
     }
 
-    /// Пропустить TxOutput: variable-length zk_proof
+    /// Skip TxOutput: variable-length zk_proof
     pub fn skip_outputs(&mut self, count: u32) -> Option<()> {
         for _ in 0..count {
             self.skip(8)?;   // amount
@@ -129,7 +129,7 @@ impl<'a> Cursor<'a> {
         Some(())
     }
 
-    /// Пропустить heartbeat witnesses
+    /// Skip heartbeat witnesses
     pub fn skip_witnesses(&mut self) -> Option<()> {
         let count = self.u32()? as usize;
         for _ in 0..count {
@@ -140,7 +140,7 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Zero-copy заголовок блока (только header поля, без транзакций).
+/// Zero-copy block header (header fields only, no transactions).
 #[derive(Debug, Clone)]
 pub struct BlockView<'a> {
     pub height: u64,
@@ -149,7 +149,7 @@ pub struct BlockView<'a> {
     pub prev_hash: Hash,
     pub block_hash: Hash,
     pub tx_count: u32,
-    /// Ссылка на исходный буфер (zero-copy)
+    /// Reference to the original buffer (zero-copy)
     pub raw: &'a [u8],
 }
 
@@ -175,7 +175,7 @@ impl<'a> BlockView<'a> {
     #[inline] pub fn is_genesis(&self) -> bool { self.height == 0 }
 }
 
-/// Zero-copy транзакция с точным размером.
+/// Zero-copy transaction with exact size.
 #[derive(Debug, Clone)]
 pub struct TxView<'a> {
     pub tx_hash: Hash,
@@ -185,9 +185,9 @@ pub struct TxView<'a> {
     pub tx_type: u8,
     pub input_count: u32,
     pub output_count: u32,
-    /// Точное количество байт, прочитанных из буфера
+    /// Exact number of bytes read from the buffer
     pub parsed_len: usize,
-    /// Ссылка ТОЛЬКО на байты этой транзакции
+    /// Reference ONLY to the bytes of this transaction
     pub raw: &'a [u8],
 }
 
@@ -227,7 +227,7 @@ impl<'a> TxView<'a> {
     #[inline] pub fn is_heartbeat(&self) -> bool { self.tx_type == 2 }
 }
 
-/// Ленивый итератор по транзакциям блока.
+/// Lazy iterator over block transactions.
 pub struct BlockTxIter<'a> {
     cursor: Cursor<'a>,
     remaining: u32,
@@ -258,7 +258,7 @@ impl<'a> Iterator for BlockTxIter<'a> {
     }
 }
 
-/// Быстрые проверки без полного парсинга.
+/// Fast checks without full parsing.
 pub struct FastValidator;
 
 impl FastValidator {
@@ -421,7 +421,7 @@ mod tests {
     #[test]
     fn block_tx_iter_multiple() {
         let mut data = make_block_wire(1, 3);
-        // Добавляем 3 транзакции
+        // Add 3 transactions
         for i in 0..3 {
             let tx = make_tx_wire(100 + i as u64 * 10, i as u64 * 100, 1, 1);
             data.extend_from_slice(&tx);
